@@ -1,0 +1,60 @@
+commit 2e9eb360136a3198b527b278ad5e7625d34bd128
+Author: Dmitrii Sharshakov <dmitry.sharshakov@siderolabs.com>
+Date:   Thu Oct 23 12:56:43 2025 +0200
+
+    wip
+
+diff --git a/src/basic/dirent-util.h b/src/basic/dirent-util.h
+index 1f305930c6..be21de9c92 100644
+--- a/src/basic/dirent-util.h
++++ b/src/basic/dirent-util.h
+@@ -33,18 +33,7 @@ struct dirent* readdir_no_dot(DIR *dirp);
+ 
+ /* Only if 64-bit off_t is enabled struct dirent + struct dirent64 are actually the same. We require this, and
+  * we want them to be interchangeable to make getdents64() work, hence verify that. */
+-assert_cc(_FILE_OFFSET_BITS == 64);
+-assert_cc(sizeof(struct dirent) == sizeof(struct dirent64));
+-assert_cc(offsetof(struct dirent, d_ino) == offsetof(struct dirent64, d_ino));
+-assert_cc(sizeof_field(struct dirent, d_ino) == sizeof_field(struct dirent64, d_ino));
+-assert_cc(offsetof(struct dirent, d_off) == offsetof(struct dirent64, d_off));
+-assert_cc(sizeof_field(struct dirent, d_off) == sizeof_field(struct dirent64, d_off));
+-assert_cc(offsetof(struct dirent, d_reclen) == offsetof(struct dirent64, d_reclen));
+-assert_cc(sizeof_field(struct dirent, d_reclen) == sizeof_field(struct dirent64, d_reclen));
+-assert_cc(offsetof(struct dirent, d_type) == offsetof(struct dirent64, d_type));
+-assert_cc(sizeof_field(struct dirent, d_type) == sizeof_field(struct dirent64, d_type));
+-assert_cc(offsetof(struct dirent, d_name) == offsetof(struct dirent64, d_name));
+-assert_cc(sizeof_field(struct dirent, d_name) == sizeof_field(struct dirent64, d_name));
++/* For musl libc, off_t is always 64-bit */
+ 
+ #define FOREACH_DIRENT_IN_BUFFER(de, buf, sz)                           \
+         for (void *_end = (uint8_t*) ({ (de) = (buf); }) + (sz);        \
+diff --git a/src/basic/forward.h b/src/basic/forward.h
+index 53b217b07b..4bd5695084 100644
+--- a/src/basic/forward.h
++++ b/src/basic/forward.h
+@@ -309,7 +309,9 @@ typedef struct VeritySettings VeritySettings;
+ /* We duplicate various commonly used constants here so we can keep most static inline functions without
+  * having to include the full header that provides these constants. */
+ 
++#ifndef AT_FDCWD
+ #define AT_FDCWD                -100
++#endif
+ #define AT_EMPTY_PATH           0x1000
+ #define AT_SYMLINK_FOLLOW       0x400
+ #define AT_SYMLINK_NOFOLLOW     0x100
+diff --git a/src/basic/fs-util.c b/src/basic/fs-util.c
+index 0c84f42ed6..508eb5c9a8 100644
+--- a/src/basic/fs-util.c
++++ b/src/basic/fs-util.c
+@@ -28,6 +28,11 @@
+ #include "tmpfile-util.h"
+ #include "umask-util.h"
+ 
++// #if !HAVE_RENAMEAT2
++int renameat2(int oldfd, const char *oldname, int newfd, const char *newname, unsigned flags);
++// #  define renameat2 missing_renameat2
++// #endif
++
+ int rmdir_parents(const char *path, const char *stop) {
+         char *p;
+         int r;

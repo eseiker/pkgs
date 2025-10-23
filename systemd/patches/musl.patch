@@ -1,51 +1,103 @@
-systemd-boot relies on wchar_t being __WCHAR_TYPE__ but musl sets it as
-int here: https://git.musl-libc.org/cgit/musl/tree/arch/x86_64/bits/alltypes.h.in?h=v1.2.4#n9
-
-So the patch below sets __DEFINED_wchar_t and loads `stddef.h` later so that we can override it.
-
-diff --git src/boot/efi.h src/boot/efi.h
-index b8d193154e..e432e9c91f 100644
---- src/boot/efi.h
-+++ src/boot/efi.h
-@@ -3,14 +3,15 @@
-
- #include <stdarg.h>
- #include <stdbool.h>
--#include <stddef.h>
- #include <stdint.h>
-
- #include "macro-fundamental.h"
-
+diff --git a/src/basic/dirent-util.c b/src/basic/dirent-util.c
+index 315413f0a1..1b3a65401b 100644
+--- a/src/basic/dirent-util.c
++++ b/src/basic/dirent-util.c
+@@ -6,6 +6,7 @@
+ #include "dirent-util.h"
+ #include "path-util.h"
+ #include "string-util.h"
++#include "stat-util.h"
+ 
+ int dirent_ensure_type(int dir_fd, struct dirent *de) {
+         STRUCT_STATX_DEFINE(sx);
+diff --git a/src/basic/fd-util.c b/src/basic/fd-util.c
+index be2932e7e6..4d5d27648c 100644
+--- a/src/basic/fd-util.c
++++ b/src/basic/fd-util.c
+@@ -1070,11 +1070,11 @@ int fds_are_same_mount(int fd1, int fd2) {
+         assert(fd1 >= 0);
+         assert(fd2 >= 0);
+ 
+-        r = statx_fallback(fd1, "", AT_EMPTY_PATH, STATX_TYPE|STATX_INO|STATX_MNT_ID, &sx1);
++        r = statx_fallback(fd1, "", AT_EMPTY_PATH, STATX_TYPE|STATX_INO|STATX_MNT_ID, &st1.sx);
+         if (r < 0)
+                 return r;
+ 
+-        r = statx_fallback(fd2, "", AT_EMPTY_PATH, STATX_TYPE|STATX_INO|STATX_MNT_ID, &sx2);
++        r = statx_fallback(fd2, "", AT_EMPTY_PATH, STATX_TYPE|STATX_INO|STATX_MNT_ID, &st2.sx);
+         if (r < 0)
+                 return r;
+ 
+diff --git a/src/basic/fs-util.c b/src/basic/fs-util.c
+index 508eb5c9a8..1a1e5ae0b2 100644
+--- a/src/basic/fs-util.c
++++ b/src/basic/fs-util.c
+@@ -28,10 +28,7 @@
+ #include "tmpfile-util.h"
+ #include "umask-util.h"
+ 
+-// #if !HAVE_RENAMEAT2
+ int renameat2(int oldfd, const char *oldname, int newfd, const char *newname, unsigned flags);
+-// #  define renameat2 missing_renameat2
+-// #endif
+ 
+ int rmdir_parents(const char *path, const char *stop) {
+         char *p;
+diff --git a/src/basic/recurse-dir.c b/src/basic/recurse-dir.c
+index bab1b86e69..72e6b97f05 100644
+--- a/src/basic/recurse-dir.c
++++ b/src/basic/recurse-dir.c
+@@ -11,6 +11,7 @@
+ #include "path-util.h"
+ #include "recurse-dir.h"
+ #include "sort-util.h"
++#include "stat-util.h"
+ 
+ #define DEFAULT_RECURSION_MAX 100
+ 
+diff --git a/src/basic/stat-util.c b/src/basic/stat-util.c
+index a9d6a97d1c..cbd6dff4be 100644
+--- a/src/basic/stat-util.c
++++ b/src/basic/stat-util.c
+@@ -4,6 +4,7 @@
+ #include <linux/magic.h>
+ #include <sys/statvfs.h>
+ #include <unistd.h>
++#include <sys/sysmacros.h>
+ 
+ #include "alloc-util.h"
+ #include "chase.h"
+diff --git a/src/boot/efi.h b/src/boot/efi.h
+index 1832df980c..805a8ca66e 100644
+--- a/src/boot/efi.h
++++ b/src/boot/efi.h
+@@ -6,7 +6,7 @@
+ #include <limits.h>                     /* IWYU pragma: export */
+ #include <stdarg.h>                     /* IWYU pragma: export */
+ #include <stdbool.h>                    /* IWYU pragma: export */
+-#include <stddef.h>                     /* IWYU pragma: export */
++#include <stddef.h>
+ #include <stdint.h>                     /* IWYU pragma: export */
+ 
+ #include "assert-fundamental.h"         /* IWYU pragma: export */
+@@ -16,7 +16,9 @@
+ 
  #if SD_BOOT
  /* uchar.h/wchar.h are not suitable for freestanding environments. */
-+#define __DEFINED_wchar_t
++// #define __DEFINED_wchar_t
  typedef __WCHAR_TYPE__ wchar_t;
-+#include <stddef.h>
++// #include <stddef.h>
  typedef __CHAR16_TYPE__ char16_t;
  typedef __CHAR32_TYPE__ char32_t;
-
-diff --git src/fundamental/macro-fundamental.h src/fundamental/macro-fundamental.h
-index 1d49765fce..113bda78c7 100644
---- src/fundamental/macro-fundamental.h
-+++ src/fundamental/macro-fundamental.h
-@@ -3,6 +3,9 @@
-
- #if !SD_BOOT
- #  include <assert.h>
-+#else
-+#define __DEFINED_wchar_t
-+#include <stddef.h>
- #endif
-
- #include <limits.h>
-diff --git src/fundamental/memory-util-fundamental.h src/fundamental/memory-util-fundamental.h
-index 78e2dbec59..4f68b56e9d 100644
---- src/fundamental/memory-util-fundamental.h
-+++ src/fundamental/memory-util-fundamental.h
+ 
+diff --git a/src/fundamental/memory-util-fundamental.h b/src/fundamental/memory-util-fundamental.h
+index c2a99a2039..581cf6578e 100644
+--- a/src/fundamental/memory-util-fundamental.h
++++ b/src/fundamental/memory-util-fundamental.h
 @@ -1,10 +1,10 @@
  /* SPDX-License-Identifier: LGPL-2.1-or-later */
  #pragma once
-
+ 
 -#include <stddef.h>
 -
  #if SD_BOOT
@@ -55,3 +107,50 @@ index 78e2dbec59..4f68b56e9d 100644
  #else
  #  include <string.h>
  #endif
+diff --git a/src/shared/ethtool-util.c b/src/shared/ethtool-util.c
+index d961a81eca..e49f53e5b6 100644
+--- a/src/shared/ethtool-util.c
++++ b/src/shared/ethtool-util.c
+@@ -1,5 +1,7 @@
+ /* SPDX-License-Identifier: LGPL-2.1-or-later */
+ 
++#define _GNU_SOURCE 1
++#define _BSD_SOURCE 1
+ #include <linux/ethtool.h>
+ #include <linux/sockios.h>
+ #include <net/if.h>
+diff --git a/src/shared/install-file.c b/src/shared/install-file.c
+index c3de84f579..270f331c2b 100644
+--- a/src/shared/install-file.c
++++ b/src/shared/install-file.c
+@@ -14,6 +14,17 @@
+ #include "rm-rf.h"
+ #include "sync-util.h"
+ 
++int renameat2(int oldfd, const char *oldname, int newfd, const char *newname, unsigned flags);
++
++int renameat2(int oldfd, const char *oldname, int newfd, const char *newname, unsigned flags) {
++#  ifdef __NR_renameat2
++        return syscall(__NR_renameat2, oldfd, oldname, newfd, newname, flags);
++#  else
++        errno = ENOSYS;
++        return -1;
++#  endif
++}
++
+ static int fs_make_very_read_only(int fd) {
+         struct stat st;
+         int r;
+diff --git a/src/shared/meson.build b/src/shared/meson.build
+index 768f446d20..75e1e51dd5 100644
+--- a/src/shared/meson.build
++++ b/src/shared/meson.build
+@@ -68,7 +68,7 @@ shared_sources = files(
+         'efi-loader.c',
+         'elf-util.c',
+         'enable-mempool.c',
+-        'ethtool-util.c',
++        # 'ethtool-util.c',
+         'exec-util.c',
+         'exit-status.c',
+         'extension-util.c',

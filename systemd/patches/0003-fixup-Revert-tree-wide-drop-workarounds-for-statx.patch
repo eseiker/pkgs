@@ -1,0 +1,185 @@
+From 9f83d6b10b9128fa2314e970d845439ac10cd350 Mon Sep 17 00:00:00 2001
+From: Dmitrii Sharshakov <dmitry.sharshakov@siderolabs.com>
+Date: Thu, 23 Oct 2025 14:18:38 +0200
+Subject: [PATCH 3/3] fixup! Revert "tree-wide: drop workarounds for statx()"
+
+---
+ meson.build             |  1 -
+ src/basic/dirent-util.c |  2 +-
+ src/shared/find-esp.c   | 21 +++++++++++----------
+ src/tmpfiles/tmpfiles.c | 24 +++++++++++++-----------
+ 4 files changed, 25 insertions(+), 23 deletions(-)
+
+diff --git a/meson.build b/meson.build
+index 9d1063e090..f15618ae76 100644
+--- a/meson.build
++++ b/meson.build
+@@ -599,7 +599,6 @@ foreach decl : ['struct statx']
+ endforeach
+ 
+ conf.set10('WANT_LINUX_STAT_H', want_linux_stat_h)
+-conf.set10('WANT_LINUX_FS_H', want_linux_fs_h)
+ 
+ foreach ident : [
+         ['set_mempolicy',     '''#include <sys/syscall.h>'''],  # declared at numaif.h provided by libnuma, which we do not use
+diff --git a/src/basic/dirent-util.c b/src/basic/dirent-util.c
+index 6137ed4855..315413f0a1 100644
+--- a/src/basic/dirent-util.c
++++ b/src/basic/dirent-util.c
+@@ -8,7 +8,7 @@
+ #include "string-util.h"
+ 
+ int dirent_ensure_type(int dir_fd, struct dirent *de) {
+-        struct statx sx;
++        STRUCT_STATX_DEFINE(sx);
+         int r;
+ 
+         assert(dir_fd >= 0);
+diff --git a/src/shared/find-esp.c b/src/shared/find-esp.c
+index 33cc900e00..d1fe9cb545 100644
+--- a/src/shared/find-esp.c
++++ b/src/shared/find-esp.c
+@@ -276,7 +276,8 @@ static int verify_fsroot_dir(
+         bool searching = FLAGS_SET(flags, VERIFY_ESP_SEARCHING),
+                 unprivileged_mode = FLAGS_SET(flags, VERIFY_ESP_UNPRIVILEGED_MODE);
+         _cleanup_free_ char *f = NULL;
+-        struct statx sxa, sxb;
++        STRUCT_NEW_STATX_DEFINE(sxa);
++        STRUCT_NEW_STATX_DEFINE(sxb);
+         int r;
+ 
+         /* Checks if the specified directory is at the root of its file system, and returns device
+@@ -294,21 +295,21 @@ static int verify_fsroot_dir(
+                 return log_error_errno(r, "Failed to extract filename of %s: %m", path);
+ 
+         r = statx_fallback(dir_fd, strempty(f), AT_SYMLINK_NOFOLLOW|(isempty(f) ? AT_EMPTY_PATH : 0),
+-                           STATX_TYPE|STATX_INO|STATX_MNT_ID, &sxa);
++                           STATX_TYPE|STATX_INO|STATX_MNT_ID, &sxa.sx);
+         if (r < 0)
+                 return log_full_errno((searching && r == -ENOENT) ||
+                                       (unprivileged_mode && ERRNO_IS_PRIVILEGE(r)) ? LOG_DEBUG : LOG_ERR, r,
+                                       "Failed to determine block device node of \"%s\": %m", path);
+ 
+-        assert(S_ISDIR(sxa.stx_mode)); /* We used O_DIRECTORY above, when opening, so this must hold */
++        assert(S_ISDIR(sxa.sx.stx_mode)); /* We used O_DIRECTORY above, when opening, so this must hold */
+ 
+-        if (FLAGS_SET(sxa.stx_attributes_mask, STATX_ATTR_MOUNT_ROOT)) {
++        if (FLAGS_SET(sxa.sx.stx_attributes_mask, STATX_ATTR_MOUNT_ROOT)) {
+ 
+                 /* If we have STATX_ATTR_MOUNT_ROOT, we are happy, that's all we need. We operate under the
+                  * assumption that a top of a mount point is also the top of the file system. (Which of
+                  * course is strictly speaking not always true...) */
+ 
+-                if (!FLAGS_SET(sxa.stx_attributes, STATX_ATTR_MOUNT_ROOT))
++                if (!FLAGS_SET(sxa.sx.stx_attributes, STATX_ATTR_MOUNT_ROOT))
+                         return log_full_errno(searching ? LOG_DEBUG : LOG_ERR,
+                                               SYNTHETIC_ERRNO(searching ? EADDRNOTAVAIL : ENODEV),
+                                               "Directory \"%s\" is not the root of the file system.", path);
+@@ -317,15 +318,15 @@ static int verify_fsroot_dir(
+         }
+ 
+         /* Now let's look at the parent */
+-        r = statx_fallback(dir_fd, "", AT_EMPTY_PATH, STATX_TYPE|STATX_INO|STATX_MNT_ID, &sxb);
++        r = statx_fallback(dir_fd, "", AT_EMPTY_PATH, STATX_TYPE|STATX_INO|STATX_MNT_ID, &sxb.sx);
+         if (r < 0)
+                 return log_full_errno(unprivileged_mode && ERRNO_IS_PRIVILEGE(r) ? LOG_DEBUG : LOG_ERR, r,
+                                       "Failed to determine block device node of parent of \"%s\": %m", path);
+ 
+-        if (statx_inode_same(&sxa, &sxb)) /* for the root dir inode nr for both inodes will be the same */
++        if (statx_inode_same(&sxa.sx, &sxb.sx)) /* for the root dir inode nr for both inodes will be the same */
+                 goto success;
+ 
+-        if (statx_mount_same(&sxa, &sxb))
++        if (statx_mount_same(&sxa.nsx, &sxb.nsx))
+                 return log_full_errno(searching ? LOG_DEBUG : LOG_ERR,
+                                       SYNTHETIC_ERRNO(searching ? EADDRNOTAVAIL : ENODEV),
+                                       "Directory \"%s\" is not the root of the file system.", path);
+@@ -334,10 +335,10 @@ success:
+         if (!ret_dev)
+                 return 0;
+ 
+-        if (sxa.stx_dev_major == 0) /* Hmm, maybe a btrfs device, and the caller asked for the backing device? Then let's try to get it. */
++        if (sxa.sx.stx_dev_major == 0) /* Hmm, maybe a btrfs device, and the caller asked for the backing device? Then let's try to get it. */
+                 return btrfs_get_block_device_at(dir_fd, strempty(f), ret_dev);
+ 
+-        *ret_dev = makedev(sxa.stx_dev_major, sxa.stx_dev_minor);
++        *ret_dev = makedev(sxa.sx.stx_dev_major, sxa.sx.stx_dev_minor);
+         return 0;
+ }
+ 
+diff --git a/src/tmpfiles/tmpfiles.c b/src/tmpfiles/tmpfiles.c
+index 396e85134c..1421dd8777 100644
+--- a/src/tmpfiles/tmpfiles.c
++++ b/src/tmpfiles/tmpfiles.c
+@@ -559,7 +559,7 @@ static int opendir_and_stat(
+                 bool *ret_mountpoint) {
+ 
+         _cleanup_closedir_ DIR *d = NULL;
+-        struct statx sx1;
++        STRUCT_NEW_STATX_DEFINE(st1);
+         int r;
+ 
+         assert(path);
+@@ -586,23 +586,24 @@ static int opendir_and_stat(
+                 return 0;
+         }
+ 
+-        r = statx_fallback(dirfd(d), "", AT_EMPTY_PATH, STATX_MODE|STATX_INO|STATX_ATIME|STATX_MTIME, &sx1);
++        r = statx_fallback(dirfd(d), "", AT_EMPTY_PATH, STATX_MODE|STATX_INO|STATX_ATIME|STATX_MTIME, &st1.sx);
+         if (r < 0)
+                 return log_error_errno(r, "statx(%s) failed: %m", path);
+ 
+-        if (FLAGS_SET(sx1.stx_attributes_mask, STATX_ATTR_MOUNT_ROOT))
+-                *ret_mountpoint = FLAGS_SET(sx1.stx_attributes, STATX_ATTR_MOUNT_ROOT);
++        if (FLAGS_SET(st1.sx.stx_attributes_mask, STATX_ATTR_MOUNT_ROOT))
++                *ret_mountpoint = FLAGS_SET(st1.sx.stx_attributes, STATX_ATTR_MOUNT_ROOT);
+         else {
+-                struct statx sx2;
+-                r = statx_fallback(dirfd(d), "..", 0, STATX_INO, &sx2);
++                STRUCT_NEW_STATX_DEFINE(st2);
++
++                r = statx_fallback(dirfd(d), "..", 0, STATX_INO, &st2.sx);
+                 if (r < 0)
+                         return log_error_errno(r, "statx(%s/..) failed: %m", path);
+ 
+-                *ret_mountpoint = !statx_mount_same(&sx1, &sx2);
++                *ret_mountpoint = !statx_mount_same(&st1.nsx, &st2.nsx);
+         }
+ 
+         *ret = TAKE_PTR(d);
+-        *ret_sx = sx1;
++        *ret_sx = st1.sx;
+         return 1;
+ }
+ 
+@@ -701,7 +702,8 @@ static int dir_cleanup(
+                  * systems such as overlayfs better where each file is originating from a different
+                  * st_dev. */
+ 
+-                struct statx sx;
++                STRUCT_STATX_DEFINE(sx);
++
+                 r = statx_fallback(
+                                 dirfd(d), de->d_name,
+                                 AT_SYMLINK_NOFOLLOW|AT_NO_AUTOMOUNT,
+@@ -3005,7 +3007,7 @@ static int remove_recursive(
+                 bool remove_instance) {
+ 
+         _cleanup_closedir_ DIR *d = NULL;
+-        struct statx sx;
++        STRUCT_STATX_DEFINE(sx);
+         bool mountpoint;
+         int r;
+ 
+@@ -3155,7 +3157,7 @@ static int clean_item_instance(
+         usec_t cutoff = n - i->age;
+ 
+         _cleanup_closedir_ DIR *d = NULL;
+-        struct statx sx;
++        STRUCT_STATX_DEFINE(sx);
+         bool mountpoint;
+         int r;
+ 
+-- 
+2.51.0
+

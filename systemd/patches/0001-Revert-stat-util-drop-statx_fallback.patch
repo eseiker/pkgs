@@ -1,0 +1,306 @@
+From c085f346471e531426dbd844995237a547bb77eb Mon Sep 17 00:00:00 2001
+From: Dmitrii Sharshakov <dmitry.sharshakov@siderolabs.com>
+Date: Thu, 23 Oct 2025 13:19:41 +0200
+Subject: [PATCH 1/2] Revert "stat-util: drop statx_fallback()"
+
+This reverts commit d5ddc0e0d3a2f869e6d18ff78390ab16a8f9de98.
+---
+ src/basic/dirent-util.c |  6 ++--
+ src/basic/fd-util.c     | 10 +++---
+ src/basic/recurse-dir.c | 29 +++++++++--------
+ src/basic/stat-util.c   | 70 +++++++++++++++++++++++++++++++++++++++++
+ src/basic/stat-util.h   |  2 ++
+ src/shared/find-esp.c   | 15 ++++-----
+ src/tmpfiles/tmpfiles.c | 27 +++++++++-------
+ 7 files changed, 121 insertions(+), 38 deletions(-)
+
+diff --git a/src/basic/dirent-util.c b/src/basic/dirent-util.c
+index 2d0c10f6fe..6137ed4855 100644
+--- a/src/basic/dirent-util.c
++++ b/src/basic/dirent-util.c
+@@ -9,6 +9,7 @@
+ 
+ int dirent_ensure_type(int dir_fd, struct dirent *de) {
+         struct statx sx;
++        int r;
+ 
+         assert(dir_fd >= 0);
+         assert(de);
+@@ -22,8 +23,9 @@ int dirent_ensure_type(int dir_fd, struct dirent *de) {
+         }
+ 
+         /* Let's ask only for the type, nothing else. */
+-        if (statx(dir_fd, de->d_name, AT_SYMLINK_NOFOLLOW|AT_NO_AUTOMOUNT, STATX_TYPE, &sx) < 0)
+-                return -errno;
++        r = statx_fallback(dir_fd, de->d_name, AT_SYMLINK_NOFOLLOW|AT_NO_AUTOMOUNT, STATX_TYPE, &sx);
++        if (r < 0)
++                return r;
+ 
+         assert(FLAGS_SET(sx.stx_mask, STATX_TYPE));
+         de->d_type = IFTODT(sx.stx_mode);
+diff --git a/src/basic/fd-util.c b/src/basic/fd-util.c
+index a6118b4247..f88e96c3eb 100644
+--- a/src/basic/fd-util.c
++++ b/src/basic/fd-util.c
+@@ -1069,11 +1069,13 @@ int fds_are_same_mount(int fd1, int fd2) {
+         assert(fd1 >= 0);
+         assert(fd2 >= 0);
+ 
+-        if (statx(fd1, "", AT_EMPTY_PATH, STATX_TYPE|STATX_INO|STATX_MNT_ID, &sx1) < 0)
+-                return -errno;
++        r = statx_fallback(fd1, "", AT_EMPTY_PATH, STATX_TYPE|STATX_INO|STATX_MNT_ID, &sx1);
++        if (r < 0)
++                return r;
+ 
+-        if (statx(fd2, "", AT_EMPTY_PATH, STATX_TYPE|STATX_INO|STATX_MNT_ID, &sx2) < 0)
+-                return -errno;
++        r = statx_fallback(fd2, "", AT_EMPTY_PATH, STATX_TYPE|STATX_INO|STATX_MNT_ID, &sx2);
++        if (r < 0)
++                return r;
+ 
+         /* First, compare inode. If these are different, the fd does not point to the root directory "/". */
+         if (!statx_inode_same(&sx1, &sx2))
+diff --git a/src/basic/recurse-dir.c b/src/basic/recurse-dir.c
+index 2f63aa48f9..4b4e08ada2 100644
+--- a/src/basic/recurse-dir.c
++++ b/src/basic/recurse-dir.c
+@@ -169,8 +169,9 @@ int recurse_dir(
+ 
+         if (FLAGS_SET(flags, RECURSE_DIR_TOPLEVEL)) {
+                 if (statx_mask != 0) {
+-                        if (statx(dir_fd, "", AT_EMPTY_PATH, statx_mask, &root_sx) < 0)
+-                                return -errno;
++                        r = statx_fallback(dir_fd, "", AT_EMPTY_PATH, statx_mask, &root_sx);
++                        if (r < 0)
++                                return r;
+                 }
+ 
+                 r = func(RECURSE_DIR_ENTER,
+@@ -249,8 +250,9 @@ int recurse_dir(
+                                 i->d_type = DT_DIR;
+ 
+                                 if (statx_mask != 0 || (flags & RECURSE_DIR_SAME_MOUNT)) {
+-                                        if (statx(subdir_fd, "", AT_EMPTY_PATH, statx_mask, &sx) < 0)
+-                                                return -errno;
++                                        r = statx_fallback(subdir_fd, "", AT_EMPTY_PATH, statx_mask, &sx);
++                                        if (r < 0)
++                                                return r;
+ 
+                                         sx_valid = true;
+                                 }
+@@ -290,8 +292,9 @@ int recurse_dir(
+                                  * assume. Let's guarantee that we never pass statx data of a directory where
+                                  * caller expects a non-directory */
+ 
+-                                if (statx(inode_fd, "", AT_EMPTY_PATH, statx_mask | STATX_TYPE, &sx) < 0)
+-                                        return -errno;
++                                r = statx_fallback(inode_fd, "", AT_EMPTY_PATH, statx_mask | STATX_TYPE, &sx);
++                                if (r < 0)
++                                        return r;
+ 
+                                 assert(sx.stx_mask & STATX_TYPE);
+                                 sx_valid = true;
+@@ -311,15 +314,15 @@ int recurse_dir(
+ 
+                         } else if (statx_mask != 0 || (i->d_type == DT_UNKNOWN && (flags & RECURSE_DIR_ENSURE_TYPE))) {
+ 
+-                                if (statx(dir_fd, i->d_name, AT_SYMLINK_NOFOLLOW, statx_mask | STATX_TYPE, &sx) < 0) {
+-                                        if (errno == ENOENT) /* Vanished by now? Go for next file immediately */
+-                                                continue;
+-
+-                                        log_debug_errno(errno, "Failed to stat directory entry '%s': %m", p);
++                                r = statx_fallback(dir_fd, i->d_name, AT_SYMLINK_NOFOLLOW, statx_mask | STATX_TYPE, &sx);
++                                if (r == -ENOENT) /* Vanished by now? Go for next file immediately */
++                                        continue;
++                                if (r < 0) {
++                                        log_debug_errno(r, "Failed to stat directory entry '%s': %m", p);
+ 
+-                                        assert(errno <= RECURSE_DIR_SKIP_STAT_INODE_ERROR_MAX - RECURSE_DIR_SKIP_STAT_INODE_ERROR_BASE);
++                                        assert(-r <= RECURSE_DIR_SKIP_STAT_INODE_ERROR_MAX - RECURSE_DIR_SKIP_STAT_INODE_ERROR_BASE);
+ 
+-                                        r = func(RECURSE_DIR_SKIP_STAT_INODE_ERROR_BASE + errno,
++                                        r = func(RECURSE_DIR_SKIP_STAT_INODE_ERROR_BASE + -r,
+                                                  p,
+                                                  dir_fd,
+                                                  /* inode_fd = */ -EBADF,
+diff --git a/src/basic/stat-util.c b/src/basic/stat-util.c
+index 5582c59037..75fff4917f 100644
+--- a/src/basic/stat-util.c
++++ b/src/basic/stat-util.c
+@@ -480,6 +480,76 @@ bool statx_mount_same(const struct statx *a, const struct statx *b) {
+                 a->stx_dev_minor == b->stx_dev_minor;
+ }
+ 
++static bool is_statx_fatal_error(int err, int flags) {
++        assert(err < 0);
++
++        /* If statx() is not supported or if we see EPERM (which might indicate seccomp filtering or so),
++         * let's do a fallback. Note that on EACCES we'll not fall back, since that is likely an indication of
++         * fs access issues, which we should propagate. */
++        if (ERRNO_IS_NOT_SUPPORTED(err) || err == -EPERM)
++                return false;
++
++        /* When unsupported flags are specified, glibc's fallback function returns -EINVAL.
++         * See statx_generic() in glibc. */
++        if (err != -EINVAL)
++                return true;
++
++        if ((flags & ~(AT_EMPTY_PATH | AT_NO_AUTOMOUNT | AT_SYMLINK_NOFOLLOW | AT_STATX_SYNC_AS_STAT)) != 0)
++                return false; /* Unsupported flags are specified. Let's try to use our implementation. */
++
++        return true;
++}
++
++int statx_fallback(int dfd, const char *path, int flags, unsigned mask, struct statx *sx) {
++        static bool avoid_statx = false;
++        struct stat st;
++        int r;
++
++        if (!avoid_statx) {
++                r = RET_NERRNO(statx(dfd, path, flags, mask, sx));
++                if (r >= 0 || is_statx_fatal_error(r, flags))
++                        return r;
++
++                avoid_statx = true;
++        }
++
++        /* Only do fallback if fstatat() supports the flag too, or if it's one of the sync flags, which are
++         * OK to ignore */
++        if ((flags & ~(AT_EMPTY_PATH|AT_NO_AUTOMOUNT|AT_SYMLINK_NOFOLLOW|
++                      AT_STATX_SYNC_AS_STAT|AT_STATX_FORCE_SYNC|AT_STATX_DONT_SYNC)) != 0)
++                return -EOPNOTSUPP;
++
++        if (fstatat(dfd, path, &st, flags & (AT_EMPTY_PATH|AT_NO_AUTOMOUNT|AT_SYMLINK_NOFOLLOW)) < 0)
++                return -errno;
++
++        *sx = (struct statx) {
++                .stx_mask = STATX_TYPE|STATX_MODE|
++                STATX_NLINK|STATX_UID|STATX_GID|
++                STATX_ATIME|STATX_MTIME|STATX_CTIME|
++                STATX_INO|STATX_SIZE|STATX_BLOCKS,
++                .stx_blksize = st.st_blksize,
++                .stx_nlink = st.st_nlink,
++                .stx_uid = st.st_uid,
++                .stx_gid = st.st_gid,
++                .stx_mode = st.st_mode,
++                .stx_ino = st.st_ino,
++                .stx_size = st.st_size,
++                .stx_blocks = st.st_blocks,
++                .stx_rdev_major = major(st.st_rdev),
++                .stx_rdev_minor = minor(st.st_rdev),
++                .stx_dev_major = major(st.st_dev),
++                .stx_dev_minor = minor(st.st_dev),
++                .stx_atime.tv_sec = st.st_atim.tv_sec,
++                .stx_atime.tv_nsec = st.st_atim.tv_nsec,
++                .stx_mtime.tv_sec = st.st_mtim.tv_sec,
++                .stx_mtime.tv_nsec = st.st_mtim.tv_nsec,
++                .stx_ctime.tv_sec = st.st_ctim.tv_sec,
++                .stx_ctime.tv_nsec = st.st_ctim.tv_nsec,
++        };
++
++        return 0;
++}
++
+ int xstatfsat(int dir_fd, const char *path, struct statfs *ret) {
+         _cleanup_close_ int fd = -EBADF;
+ 
+diff --git a/src/basic/stat-util.h b/src/basic/stat-util.h
+index 347d885a19..48603e9e4a 100644
+--- a/src/basic/stat-util.h
++++ b/src/basic/stat-util.h
+@@ -87,6 +87,8 @@ bool stat_inode_unmodified(const struct stat *a, const struct stat *b);
+ bool statx_inode_same(const struct statx *a, const struct statx *b);
+ bool statx_mount_same(const struct statx *a, const struct statx *b);
+ 
++int statx_fallback(int dfd, const char *path, int flags, unsigned mask, struct statx *sx);
++
+ int xstatfsat(int dir_fd, const char *path, struct statfs *ret);
+ 
+ usec_t statx_timestamp_load(const struct statx_timestamp *ts) _pure_;
+diff --git a/src/shared/find-esp.c b/src/shared/find-esp.c
+index eabc3efc5e..33cc900e00 100644
+--- a/src/shared/find-esp.c
++++ b/src/shared/find-esp.c
+@@ -293,11 +293,11 @@ static int verify_fsroot_dir(
+         if (r < 0 && r != -EADDRNOTAVAIL)
+                 return log_error_errno(r, "Failed to extract filename of %s: %m", path);
+ 
+-        if (statx(dir_fd, strempty(f),
+-                  AT_SYMLINK_NOFOLLOW|(isempty(f) ? AT_EMPTY_PATH : 0),
+-                  STATX_TYPE|STATX_INO|STATX_MNT_ID, &sxa) < 0)
+-                return log_full_errno((searching && errno == ENOENT) ||
+-                                      (unprivileged_mode && ERRNO_IS_PRIVILEGE(errno)) ? LOG_DEBUG : LOG_ERR, errno,
++        r = statx_fallback(dir_fd, strempty(f), AT_SYMLINK_NOFOLLOW|(isempty(f) ? AT_EMPTY_PATH : 0),
++                           STATX_TYPE|STATX_INO|STATX_MNT_ID, &sxa);
++        if (r < 0)
++                return log_full_errno((searching && r == -ENOENT) ||
++                                      (unprivileged_mode && ERRNO_IS_PRIVILEGE(r)) ? LOG_DEBUG : LOG_ERR, r,
+                                       "Failed to determine block device node of \"%s\": %m", path);
+ 
+         assert(S_ISDIR(sxa.stx_mode)); /* We used O_DIRECTORY above, when opening, so this must hold */
+@@ -317,8 +317,9 @@ static int verify_fsroot_dir(
+         }
+ 
+         /* Now let's look at the parent */
+-        if (statx(dir_fd, "", AT_EMPTY_PATH, STATX_TYPE|STATX_INO|STATX_MNT_ID, &sxb) < 0)
+-                return log_full_errno(unprivileged_mode && ERRNO_IS_PRIVILEGE(errno) ? LOG_DEBUG : LOG_ERR, errno,
++        r = statx_fallback(dir_fd, "", AT_EMPTY_PATH, STATX_TYPE|STATX_INO|STATX_MNT_ID, &sxb);
++        if (r < 0)
++                return log_full_errno(unprivileged_mode && ERRNO_IS_PRIVILEGE(r) ? LOG_DEBUG : LOG_ERR, r,
+                                       "Failed to determine block device node of parent of \"%s\": %m", path);
+ 
+         if (statx_inode_same(&sxa, &sxb)) /* for the root dir inode nr for both inodes will be the same */
+diff --git a/src/tmpfiles/tmpfiles.c b/src/tmpfiles/tmpfiles.c
+index 2e1fd87f54..396e85134c 100644
+--- a/src/tmpfiles/tmpfiles.c
++++ b/src/tmpfiles/tmpfiles.c
+@@ -586,15 +586,17 @@ static int opendir_and_stat(
+                 return 0;
+         }
+ 
+-        if (statx(dirfd(d), "", AT_EMPTY_PATH, STATX_MODE|STATX_INO|STATX_ATIME|STATX_MTIME, &sx1) < 0)
+-                return log_error_errno(errno, "statx(%s) failed: %m", path);
++        r = statx_fallback(dirfd(d), "", AT_EMPTY_PATH, STATX_MODE|STATX_INO|STATX_ATIME|STATX_MTIME, &sx1);
++        if (r < 0)
++                return log_error_errno(r, "statx(%s) failed: %m", path);
+ 
+         if (FLAGS_SET(sx1.stx_attributes_mask, STATX_ATTR_MOUNT_ROOT))
+                 *ret_mountpoint = FLAGS_SET(sx1.stx_attributes, STATX_ATTR_MOUNT_ROOT);
+         else {
+                 struct statx sx2;
+-                if (statx(dirfd(d), "..", 0, STATX_INO, &sx2) < 0)
+-                        return log_error_errno(errno, "statx(%s/..) failed: %m", path);
++                r = statx_fallback(dirfd(d), "..", 0, STATX_INO, &sx2);
++                if (r < 0)
++                        return log_error_errno(r, "statx(%s/..) failed: %m", path);
+ 
+                 *ret_mountpoint = !statx_mount_same(&sx1, &sx2);
+         }
+@@ -700,15 +702,16 @@ static int dir_cleanup(
+                  * st_dev. */
+ 
+                 struct statx sx;
+-                if (statx(dirfd(d), de->d_name,
+-                          AT_SYMLINK_NOFOLLOW|AT_NO_AUTOMOUNT,
+-                          STATX_TYPE|STATX_MODE|STATX_UID|STATX_ATIME|STATX_MTIME|STATX_CTIME|STATX_BTIME,
+-                          &sx) < 0) {
+-                        if (errno == ENOENT)
+-                                continue;
+-
++                r = statx_fallback(
++                                dirfd(d), de->d_name,
++                                AT_SYMLINK_NOFOLLOW|AT_NO_AUTOMOUNT,
++                                STATX_TYPE|STATX_MODE|STATX_UID|STATX_ATIME|STATX_MTIME|STATX_CTIME|STATX_BTIME,
++                                &sx);
++                if (r == -ENOENT)
++                        continue;
++                if (r < 0) {
+                         /* FUSE, NFS mounts, SELinux might return EACCES */
+-                        log_full_errno(errno == EACCES ? LOG_DEBUG : LOG_ERR, errno,
++                        log_full_errno(r == -EACCES ? LOG_DEBUG : LOG_ERR, r,
+                                        "statx(%s/%s) failed: %m", p, de->d_name);
+                         continue;
+                 }
+-- 
+2.51.0
+

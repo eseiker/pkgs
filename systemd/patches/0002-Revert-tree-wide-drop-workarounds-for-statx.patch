@@ -1,0 +1,2702 @@
+From 421bccd1792fa01abbb873d510f5b39366065b45 Mon Sep 17 00:00:00 2001
+From: Dmitrii Sharshakov <dmitry.sharshakov@siderolabs.com>
+Date: Thu, 23 Oct 2025 14:17:40 +0200
+Subject: [PATCH 2/2] Revert "tree-wide: drop workarounds for statx()"
+
+This reverts commit 4424e6c811f46bf2c53c9056a058ba277cfdee40.
+---
+ meson.build                                  |   32 +
+ src/basic/dirent-util.c                      |    2 +-
+ src/basic/fd-util.c                          |   19 +-
+ src/basic/missing_stat.h                     |  135 ++
+ src/basic/missing_syscall.h                  |  683 +++++++++
+ src/basic/missing_syscall_def.h              | 1403 ++++++++++++++++++
+ src/basic/mountpoint-util.c                  |   18 +-
+ src/basic/recurse-dir.c                      |    4 +-
+ src/basic/stat-util.c                        |    4 +-
+ src/basic/stat-util.h                        |   25 +-
+ src/basic/xattr-util.c                       |    2 +-
+ src/include/override/sys/generate-syscall.py |    1 +
+ src/shared/find-esp.c                        |   21 +-
+ src/tmpfiles/tmpfiles.c                      |   24 +-
+ 14 files changed, 2330 insertions(+), 43 deletions(-)
+ create mode 100644 src/basic/missing_stat.h
+ create mode 100644 src/basic/missing_syscall.h
+ create mode 100644 src/basic/missing_syscall_def.h
+
+diff --git a/meson.build b/meson.build
+index 842f058f04..f15618ae76 100644
+--- a/meson.build
++++ b/meson.build
+@@ -571,6 +571,35 @@ long_max = cc.compute_int(
+ assert(long_max > 100000)
+ conf.set_quoted('LONG_MAX_STR', '@0@'.format(long_max))
+ 
++decl_headers = '''
++#include <dirent.h>
++#include <sched.h>
++#include <sys/mount.h>
++#include <sys/stat.h>
++#include <uchar.h>
++'''
++
++foreach decl : ['struct statx']
++
++        # We get -1 if the size cannot be determined
++        have = cc.sizeof(decl, prefix : decl_headers, args : '-D_GNU_SOURCE') > 0
++
++        if decl == 'struct statx'
++                if have
++                        want_linux_stat_h = false
++                else
++                        have = cc.sizeof(decl,
++                                         prefix : decl_headers + '#include <linux/stat.h>',
++                                         args : '-D_GNU_SOURCE') > 0
++                        want_linux_stat_h = have
++                endif
++        endif
++
++        conf.set10('HAVE_' + decl.underscorify().to_upper(), have)
++endforeach
++
++conf.set10('WANT_LINUX_STAT_H', want_linux_stat_h)
++
+ foreach ident : [
+         ['set_mempolicy',     '''#include <sys/syscall.h>'''],  # declared at numaif.h provided by libnuma, which we do not use
+         ['get_mempolicy',     '''#include <sys/syscall.h>'''],  # declared at numaif.h provided by libnuma, which we do not use
+@@ -603,6 +632,9 @@ foreach ident : [
+         ['setxattrat',        '''#include <sys/xattr.h>'''],    # no known header declares setxattrat
+         ['removexattrat',     '''#include <sys/xattr.h>'''],    # no known header declares removexattrat
+         ['pivot_root',        '''#include <unistd.h>'''],       # no known header declares pivot_root
++        ['statx',             '''#include <sys/types.h>
++                                 #include <sys/stat.h>
++                                 #include <unistd.h>'''],
+ ]
+ 
+         have = cc.has_function(ident[0], prefix : ident[1], args : '-D_GNU_SOURCE')
+diff --git a/src/basic/dirent-util.c b/src/basic/dirent-util.c
+index 6137ed4855..315413f0a1 100644
+--- a/src/basic/dirent-util.c
++++ b/src/basic/dirent-util.c
+@@ -8,7 +8,7 @@
+ #include "string-util.h"
+ 
+ int dirent_ensure_type(int dir_fd, struct dirent *de) {
+-        struct statx sx;
++        STRUCT_STATX_DEFINE(sx);
+         int r;
+ 
+         assert(dir_fd >= 0);
+diff --git a/src/basic/fd-util.c b/src/basic/fd-util.c
+index f88e96c3eb..be2932e7e6 100644
+--- a/src/basic/fd-util.c
++++ b/src/basic/fd-util.c
+@@ -1063,7 +1063,8 @@ int path_is_root_at(int dir_fd, const char *path) {
+ }
+ 
+ int fds_are_same_mount(int fd1, int fd2) {
+-        struct statx sx1 = {}, sx2 = {}; /* explicitly initialize the struct to make msan silent. */
++        STRUCT_NEW_STATX_DEFINE(st1);
++        STRUCT_NEW_STATX_DEFINE(st2);
+         int r;
+ 
+         assert(fd1 >= 0);
+@@ -1078,14 +1079,14 @@ int fds_are_same_mount(int fd1, int fd2) {
+                 return r;
+ 
+         /* First, compare inode. If these are different, the fd does not point to the root directory "/". */
+-        if (!statx_inode_same(&sx1, &sx2))
++        if (!statx_inode_same(&st1.sx, &st2.sx))
+                 return false;
+ 
+         /* Note, statx() does not provide the mount ID and path_get_mnt_id_at() does not work when an old
+          * kernel is used. In that case, let's assume that we do not have such spurious mount points in an
+          * early boot stage, and silently skip the following check. */
+ 
+-        if (!FLAGS_SET(sx1.stx_mask, STATX_MNT_ID)) {
++        if (!FLAGS_SET(st1.nsx.stx_mask, STATX_MNT_ID)) {
+                 int mntid;
+ 
+                 r = path_get_mnt_id_at_fallback(fd1, "", &mntid);
+@@ -1093,11 +1094,11 @@ int fds_are_same_mount(int fd1, int fd2) {
+                         return r;
+                 assert(mntid >= 0);
+ 
+-                sx1.stx_mnt_id = mntid;
+-                sx1.stx_mask |= STATX_MNT_ID;
++                st1.nsx.stx_mnt_id = mntid;
++                st1.nsx.stx_mask |= STATX_MNT_ID;
+         }
+ 
+-        if (!FLAGS_SET(sx2.stx_mask, STATX_MNT_ID)) {
++        if (!FLAGS_SET(st2.nsx.stx_mask, STATX_MNT_ID)) {
+                 int mntid;
+ 
+                 r = path_get_mnt_id_at_fallback(fd2, "", &mntid);
+@@ -1105,11 +1106,11 @@ int fds_are_same_mount(int fd1, int fd2) {
+                         return r;
+                 assert(mntid >= 0);
+ 
+-                sx2.stx_mnt_id = mntid;
+-                sx2.stx_mask |= STATX_MNT_ID;
++                st2.nsx.stx_mnt_id = mntid;
++                st2.nsx.stx_mask |= STATX_MNT_ID;
+         }
+ 
+-        return statx_mount_same(&sx1, &sx2);
++        return statx_mount_same(&st1.nsx, &st2.nsx);
+ }
+ 
+ char* format_proc_fd_path(char buf[static PROC_FD_PATH_MAX], int fd) {
+diff --git a/src/basic/missing_stat.h b/src/basic/missing_stat.h
+new file mode 100644
+index 0000000000..eba1a3876f
+--- /dev/null
++++ b/src/basic/missing_stat.h
+@@ -0,0 +1,135 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++
++#include <linux/types.h>
++#include <sys/stat.h>
++
++#if WANT_LINUX_STAT_H
++#include <linux/stat.h>
++#endif
++
++/* The newest definition we are aware of (fa2fcf4f1df1559a0a4ee0f46915b496cc2ebf60; 5.8) */
++#define STATX_DEFINITION {                      \
++        __u32 stx_mask;                         \
++        __u32 stx_blksize;                      \
++        __u64 stx_attributes;                   \
++        __u32 stx_nlink;                        \
++        __u32 stx_uid;                          \
++        __u32 stx_gid;                          \
++        __u16 stx_mode;                         \
++        __u16 __spare0[1];                      \
++        __u64 stx_ino;                          \
++        __u64 stx_size;                         \
++        __u64 stx_blocks;                       \
++        __u64 stx_attributes_mask;              \
++        struct statx_timestamp stx_atime;       \
++        struct statx_timestamp stx_btime;       \
++        struct statx_timestamp stx_ctime;       \
++        struct statx_timestamp stx_mtime;       \
++        __u32 stx_rdev_major;                   \
++        __u32 stx_rdev_minor;                   \
++        __u32 stx_dev_major;                    \
++        __u32 stx_dev_minor;                    \
++        __u64 stx_mnt_id;                       \
++        __u64 __spare2;                         \
++        __u64 __spare3[12];                     \
++}
++
++#if !HAVE_STRUCT_STATX
++struct statx_timestamp {
++        __s64 tv_sec;
++        __u32 tv_nsec;
++        __s32 __reserved;
++};
++
++struct statx STATX_DEFINITION;
++#endif
++
++/* Always define the newest version we are aware of as a distinct type, so that we can use it even if glibc
++ * defines an older definition */
++struct new_statx STATX_DEFINITION;
++
++/* a528d35e8bfcc521d7cb70aaf03e1bd296c8493f (4.11) */
++#ifndef AT_STATX_SYNC_AS_STAT
++#define AT_STATX_SYNC_AS_STAT 0x0000
++#endif
++
++/* a528d35e8bfcc521d7cb70aaf03e1bd296c8493f (4.11) */
++#ifndef AT_STATX_FORCE_SYNC
++#define AT_STATX_FORCE_SYNC 0x2000
++#endif
++
++/* a528d35e8bfcc521d7cb70aaf03e1bd296c8493f (4.11) */
++#ifndef AT_STATX_DONT_SYNC
++#define AT_STATX_DONT_SYNC 0x4000
++#endif
++
++/* a528d35e8bfcc521d7cb70aaf03e1bd296c8493f (4.11) */
++#ifndef STATX_TYPE
++#define STATX_TYPE 0x00000001U
++#endif
++
++/* a528d35e8bfcc521d7cb70aaf03e1bd296c8493f (4.11) */
++#ifndef STATX_MODE
++#define STATX_MODE 0x00000002U
++#endif
++
++/* a528d35e8bfcc521d7cb70aaf03e1bd296c8493f (4.11) */
++#ifndef STATX_NLINK
++#define STATX_NLINK 0x00000004U
++#endif
++
++/* a528d35e8bfcc521d7cb70aaf03e1bd296c8493f (4.11) */
++#ifndef STATX_UID
++#define STATX_UID 0x00000008U
++#endif
++
++/* a528d35e8bfcc521d7cb70aaf03e1bd296c8493f (4.11) */
++#ifndef STATX_GID
++#define STATX_GID 0x00000010U
++#endif
++
++/* a528d35e8bfcc521d7cb70aaf03e1bd296c8493f (4.11) */
++#ifndef STATX_ATIME
++#define STATX_ATIME 0x00000020U
++#endif
++
++/* a528d35e8bfcc521d7cb70aaf03e1bd296c8493f (4.11) */
++#ifndef STATX_MTIME
++#define STATX_MTIME 0x00000040U
++#endif
++
++/* a528d35e8bfcc521d7cb70aaf03e1bd296c8493f (4.11) */
++#ifndef STATX_CTIME
++#define STATX_CTIME 0x00000080U
++#endif
++
++/* a528d35e8bfcc521d7cb70aaf03e1bd296c8493f (4.11) */
++#ifndef STATX_INO
++#define STATX_INO 0x00000100U
++#endif
++
++/* a528d35e8bfcc521d7cb70aaf03e1bd296c8493f (4.11) */
++#ifndef STATX_SIZE
++#define STATX_SIZE 0x00000200U
++#endif
++
++/* a528d35e8bfcc521d7cb70aaf03e1bd296c8493f (4.11) */
++#ifndef STATX_BLOCKS
++#define STATX_BLOCKS 0x00000400U
++#endif
++
++/* a528d35e8bfcc521d7cb70aaf03e1bd296c8493f (4.11) */
++#ifndef STATX_BTIME
++#define STATX_BTIME 0x00000800U
++#endif
++
++/* fa2fcf4f1df1559a0a4ee0f46915b496cc2ebf60 (5.8) */
++#ifndef STATX_MNT_ID
++#define STATX_MNT_ID 0x00001000U
++#endif
++
++/* 80340fe3605c0e78cfe496c3b3878be828cfdbfe (5.8) */
++#ifndef STATX_ATTR_MOUNT_ROOT
++#define STATX_ATTR_MOUNT_ROOT 0x00002000 /* Root of a mount */
++#endif
+diff --git a/src/basic/missing_syscall.h b/src/basic/missing_syscall.h
+new file mode 100644
+index 0000000000..f4eb4dd57b
+--- /dev/null
++++ b/src/basic/missing_syscall.h
+@@ -0,0 +1,683 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++#pragma once
++
++/* Missing glibc definitions to access certain kernel APIs */
++
++#include <errno.h>
++#include <fcntl.h>
++#include <linux/time_types.h>
++#include <signal.h>
++#include <sys/syscall.h>
++#include <sys/types.h>
++#include <sys/wait.h>
++#include <unistd.h>
++
++#ifdef ARCH_MIPS
++#include <asm/sgidefs.h>
++#endif
++
++#include "macro.h"
++#include "missing_keyctl.h"
++#include "missing_sched.h"
++#include "missing_stat.h"
++#include "missing_syscall_def.h"
++
++/* ======================================================================= */
++
++#if !HAVE_FCHMODAT2
++static inline int missing_fchmodat2(int dirfd, const char *path, mode_t mode, int flags) {
++#  ifdef __NR_fchmodat2
++        return syscall(__NR_fchmodat2, dirfd, path, mode, flags);
++#  else
++        errno = ENOSYS;
++        return -1;
++#  endif
++}
++
++#  define fchmodat2 missing_fchmodat2
++#endif
++
++/* ======================================================================= */
++
++#if !HAVE_PIVOT_ROOT
++static inline int missing_pivot_root(const char *new_root, const char *put_old) {
++        return syscall(__NR_pivot_root, new_root, put_old);
++}
++
++#  define pivot_root missing_pivot_root
++#endif
++
++/* ======================================================================= */
++
++#if !HAVE_IOPRIO_GET
++static inline int missing_ioprio_get(int which, int who) {
++        return syscall(__NR_ioprio_get, which, who);
++}
++
++#  define ioprio_get missing_ioprio_get
++#endif
++
++/* ======================================================================= */
++
++#if !HAVE_IOPRIO_SET
++static inline int missing_ioprio_set(int which, int who, int ioprio) {
++        return syscall(__NR_ioprio_set, which, who, ioprio);
++}
++
++#  define ioprio_set missing_ioprio_set
++#endif
++
++/* ======================================================================= */
++
++#if !HAVE_MEMFD_CREATE
++static inline int missing_memfd_create(const char *name, unsigned int flags) {
++        return syscall(__NR_memfd_create, name, flags);
++}
++
++#  define memfd_create missing_memfd_create
++#endif
++
++/* ======================================================================= */
++
++#if !HAVE_GETRANDOM
++/* glibc says getrandom() returns ssize_t */
++static inline ssize_t missing_getrandom(void *buffer, size_t count, unsigned flags) {
++        return syscall(__NR_getrandom, buffer, count, flags);
++}
++
++#  define getrandom missing_getrandom
++#endif
++
++/* ======================================================================= */
++
++/* The syscall has been defined since forever, but the glibc wrapper was missing. */
++#if !HAVE_GETTID
++static inline pid_t missing_gettid(void) {
++#  if defined __NR_gettid && __NR_gettid >= 0
++        return (pid_t) syscall(__NR_gettid);
++#  else
++#    error "__NR_gettid not defined"
++#  endif
++}
++
++#  define gettid missing_gettid
++#endif
++
++/* ======================================================================= */
++
++#if !HAVE_NAME_TO_HANDLE_AT
++struct file_handle {
++        unsigned int handle_bytes;
++        int handle_type;
++        unsigned char f_handle[0];
++};
++
++static inline int missing_name_to_handle_at(int fd, const char *name, struct file_handle *handle, int *mnt_id, int flags) {
++#  ifdef __NR_name_to_handle_at
++        return syscall(__NR_name_to_handle_at, fd, name, handle, mnt_id, flags);
++#  else
++        errno = ENOSYS;
++        return -1;
++#  endif
++}
++
++#  define name_to_handle_at missing_name_to_handle_at
++#endif
++
++/* ======================================================================= */
++
++#if !HAVE_SETNS
++static inline int missing_setns(int fd, int nstype) {
++        return syscall(__NR_setns, fd, nstype);
++}
++
++#  define setns missing_setns
++#endif
++
++/* ======================================================================= */
++
++static inline pid_t raw_getpid(void) {
++#if defined(__alpha__)
++        return (pid_t) syscall(__NR_getxpid);
++#else
++        return (pid_t) syscall(__NR_getpid);
++#endif
++}
++
++/* ======================================================================= */
++
++#if !HAVE_RENAMEAT2
++static inline int missing_renameat2(int oldfd, const char *oldname, int newfd, const char *newname, unsigned flags) {
++        return syscall(__NR_renameat2, oldfd, oldname, newfd, newname, flags);
++}
++
++#  define renameat2 missing_renameat2
++#endif
++
++/* ======================================================================= */
++
++#if !HAVE_KCMP
++static inline int missing_kcmp(pid_t pid1, pid_t pid2, int type, unsigned long idx1, unsigned long idx2) {
++        return syscall(__NR_kcmp, pid1, pid2, type, idx1, idx2);
++}
++
++#  define kcmp missing_kcmp
++#endif
++
++/* ======================================================================= */
++
++#if !HAVE_KEYCTL
++static inline long missing_keyctl(int cmd, unsigned long arg2, unsigned long arg3, unsigned long arg4, unsigned long arg5) {
++        return syscall(__NR_keyctl, cmd, arg2, arg3, arg4, arg5);
++
++#  define keyctl missing_keyctl
++}
++
++static inline key_serial_t missing_add_key(const char *type, const char *description, const void *payload, size_t plen, key_serial_t ringid) {
++        return syscall(__NR_add_key, type, description, payload, plen, ringid);
++
++#  define add_key missing_add_key
++}
++
++static inline key_serial_t missing_request_key(const char *type, const char *description, const char * callout_info, key_serial_t destringid) {
++        return syscall(__NR_request_key, type, description, callout_info, destringid);
++
++#  define request_key missing_request_key
++}
++#endif
++
++/* ======================================================================= */
++
++#if !HAVE_COPY_FILE_RANGE
++static inline ssize_t missing_copy_file_range(int fd_in, loff_t *off_in,
++                                              int fd_out, loff_t *off_out,
++                                              size_t len,
++                                              unsigned int flags) {
++#  ifdef __NR_copy_file_range
++        return syscall(__NR_copy_file_range, fd_in, off_in, fd_out, off_out, len, flags);
++#  else
++        errno = ENOSYS;
++        return -1;
++#  endif
++}
++
++#  define copy_file_range missing_copy_file_range
++#endif
++
++/* ======================================================================= */
++
++#if !HAVE_BPF
++union bpf_attr;
++
++static inline int missing_bpf(int cmd, union bpf_attr *attr, size_t size) {
++#ifdef __NR_bpf
++        return (int) syscall(__NR_bpf, cmd, attr, size);
++#else
++        errno = ENOSYS;
++        return -1;
++#endif
++}
++
++#  define bpf missing_bpf
++#endif
++
++/* ======================================================================= */
++
++#if !HAVE_STATX
++struct statx;
++
++static inline ssize_t missing_statx(int dfd, const char *filename, unsigned flags, unsigned int mask, struct statx *buffer) {
++#  ifdef __NR_statx
++        return syscall(__NR_statx, dfd, filename, flags, mask, buffer);
++#  else
++        errno = ENOSYS;
++        return -1;
++#  endif
++}
++#endif
++
++/* This typedef is supposed to be always defined. */
++typedef struct statx struct_statx;
++
++#if !HAVE_STATX
++#  define statx(dfd, filename, flags, mask, buffer) missing_statx(dfd, filename, flags, mask, buffer)
++#endif
++
++/* ======================================================================= */
++
++#if !HAVE_SET_MEMPOLICY
++enum {
++        MPOL_DEFAULT,
++        MPOL_PREFERRED,
++        MPOL_BIND,
++        MPOL_INTERLEAVE,
++        MPOL_LOCAL,
++};
++
++static inline long missing_set_mempolicy(int mode, const unsigned long *nodemask,
++                           unsigned long maxnode) {
++        long i;
++#  if defined __NR_set_mempolicy && __NR_set_mempolicy >= 0
++        i = syscall(__NR_set_mempolicy, mode, nodemask, maxnode);
++#  else
++        errno = ENOSYS;
++        i = -1;
++#  endif
++        return i;
++}
++
++#  define set_mempolicy missing_set_mempolicy
++#endif
++
++#if !HAVE_GET_MEMPOLICY
++static inline long missing_get_mempolicy(int *mode, unsigned long *nodemask,
++                           unsigned long maxnode, void *addr,
++                           unsigned long flags) {
++        long i;
++#  if defined __NR_get_mempolicy && __NR_get_mempolicy >= 0
++        i = syscall(__NR_get_mempolicy, mode, nodemask, maxnode, addr, flags);
++#  else
++        errno = ENOSYS;
++        i = -1;
++#  endif
++        return i;
++}
++
++#  define get_mempolicy missing_get_mempolicy
++#endif
++
++/* ======================================================================= */
++
++#if !HAVE_PIDFD_SEND_SIGNAL
++static inline int missing_pidfd_send_signal(int fd, int sig, siginfo_t *info, unsigned flags) {
++        return syscall(__NR_pidfd_send_signal, fd, sig, info, flags);
++}
++
++#  define pidfd_send_signal missing_pidfd_send_signal
++#endif
++
++#if !HAVE_PIDFD_OPEN
++static inline int missing_pidfd_open(pid_t pid, unsigned flags) {
++        return syscall(__NR_pidfd_open, pid, flags);
++}
++
++#  define pidfd_open missing_pidfd_open
++#endif
++
++/* ======================================================================= */
++
++#if !HAVE_RT_SIGQUEUEINFO
++static inline int missing_rt_sigqueueinfo(pid_t tgid, int sig, siginfo_t *info) {
++#  if defined __NR_rt_sigqueueinfo && __NR_rt_sigqueueinfo >= 0
++        return syscall(__NR_rt_sigqueueinfo, tgid, sig, info);
++#  else
++#    error "__NR_rt_sigqueueinfo not defined"
++#  endif
++}
++
++#  define rt_sigqueueinfo missing_rt_sigqueueinfo
++#endif
++
++/* ======================================================================= */
++
++#if !HAVE_RT_TGSIGQUEUEINFO
++static inline int missing_rt_tgsigqueueinfo(pid_t tgid, pid_t tid, int sig, siginfo_t *info) {
++#  if defined __NR_rt_tgsigqueueinfo && __NR_rt_tgsigqueueinfo >= 0
++        return syscall(__NR_rt_tgsigqueueinfo, tgid, tid, sig, info);
++#  else
++#    error "__NR_rt_tgsigqueueinfo not defined"
++#  endif
++}
++
++#  define rt_tgsigqueueinfo missing_rt_tgsigqueueinfo
++#endif
++
++/* ======================================================================= */
++
++#if !HAVE_EXECVEAT
++static inline int missing_execveat(int dirfd, const char *pathname,
++                                   char *const argv[], char *const envp[],
++                                   int flags) {
++#  if defined __NR_execveat && __NR_execveat >= 0
++        return syscall(__NR_execveat, dirfd, pathname, argv, envp, flags);
++#  else
++        errno = ENOSYS;
++        return -1;
++#  endif
++}
++
++#  undef AT_EMPTY_PATH
++#  define AT_EMPTY_PATH 0x1000
++#  define execveat missing_execveat
++#endif
++
++/* ======================================================================= */
++
++#if !HAVE_CLOSE_RANGE
++static inline int missing_close_range(unsigned first_fd, unsigned end_fd, unsigned flags) {
++#  ifdef __NR_close_range
++        /* Kernel-side the syscall expects fds as unsigned integers (just like close() actually), while
++         * userspace exclusively uses signed integers for fds. glibc chose to expose it 1:1 however, hence we
++         * do so here too, even if we end up passing signed fds to it most of the time. */
++        return syscall(__NR_close_range,
++                       first_fd,
++                       end_fd,
++                       flags);
++#  else
++        errno = ENOSYS;
++        return -1;
++#  endif
++}
++
++#  define close_range missing_close_range
++#endif
++
++/* ======================================================================= */
++
++#if !HAVE_MOUNT_SETATTR
++
++#if !HAVE_STRUCT_MOUNT_ATTR
++struct mount_attr {
++        uint64_t attr_set;
++        uint64_t attr_clr;
++        uint64_t propagation;
++        uint64_t userns_fd;
++};
++#else
++struct mount_attr;
++#endif
++
++#ifndef MOUNT_ATTR_RDONLY
++#define MOUNT_ATTR_RDONLY       0x00000001 /* Mount read-only */
++#endif
++
++#ifndef MOUNT_ATTR_NOSUID
++#define MOUNT_ATTR_NOSUID       0x00000002 /* Ignore suid and sgid bits */
++#endif
++
++#ifndef MOUNT_ATTR_NODEV
++#define MOUNT_ATTR_NODEV        0x00000004 /* Disallow access to device special files */
++#endif
++
++#ifndef MOUNT_ATTR_NOEXEC
++#define MOUNT_ATTR_NOEXEC       0x00000008 /* Disallow program execution */
++#endif
++
++#ifndef MOUNT_ATTR__ATIME
++#define MOUNT_ATTR__ATIME       0x00000070 /* Setting on how atime should be updated */
++#endif
++
++#ifndef MOUNT_ATTR_RELATIME
++#define MOUNT_ATTR_RELATIME     0x00000000 /* - Update atime relative to mtime/ctime. */
++#endif
++
++#ifndef MOUNT_ATTR_NOATIME
++#define MOUNT_ATTR_NOATIME      0x00000010 /* - Do not update access times. */
++#endif
++
++#ifndef MOUNT_ATTR_STRICTATIME
++#define MOUNT_ATTR_STRICTATIME  0x00000020 /* - Always perform atime updates */
++#endif
++
++#ifndef MOUNT_ATTR_NODIRATIME
++#define MOUNT_ATTR_NODIRATIME   0x00000080 /* Do not update directory access times */
++#endif
++
++#ifndef MOUNT_ATTR_IDMAP
++#define MOUNT_ATTR_IDMAP        0x00100000 /* Idmap mount to @userns_fd in struct mount_attr. */
++#endif
++
++#ifndef MOUNT_ATTR_NOSYMFOLLOW
++#define MOUNT_ATTR_NOSYMFOLLOW  0x00200000 /* Do not follow symlinks */
++#endif
++
++#ifndef MOUNT_ATTR_SIZE_VER0
++#define MOUNT_ATTR_SIZE_VER0    32 /* sizeof first published struct */
++#endif
++
++#ifndef AT_RECURSIVE
++#define AT_RECURSIVE 0x8000
++#endif
++
++static inline int missing_mount_setattr(
++                int dfd,
++                const char *path,
++                unsigned flags,
++                struct mount_attr *attr,
++                size_t size) {
++
++#  if defined __NR_mount_setattr && __NR_mount_setattr >= 0
++        return syscall(__NR_mount_setattr, dfd, path, flags, attr, size);
++#  else
++        errno = ENOSYS;
++        return -1;
++#  endif
++}
++
++#  define mount_setattr missing_mount_setattr
++#endif
++
++/* ======================================================================= */
++
++#if !HAVE_OPEN_TREE
++
++#ifndef OPEN_TREE_CLONE
++#define OPEN_TREE_CLONE 1
++#endif
++
++#ifndef OPEN_TREE_CLOEXEC
++#define OPEN_TREE_CLOEXEC O_CLOEXEC
++#endif
++
++static inline int missing_open_tree(
++                int dfd,
++                const char *filename,
++                unsigned flags) {
++
++#  if defined __NR_open_tree && __NR_open_tree >= 0
++        return syscall(__NR_open_tree, dfd, filename, flags);
++#  else
++        errno = ENOSYS;
++        return -1;
++#  endif
++}
++
++#  define open_tree missing_open_tree
++#endif
++
++/* ======================================================================= */
++
++#ifndef MOVE_MOUNT_BENEATH
++#define MOVE_MOUNT_BENEATH 0x00000200
++#endif
++
++#if !HAVE_MOVE_MOUNT
++
++#ifndef MOVE_MOUNT_F_EMPTY_PATH
++#define MOVE_MOUNT_F_EMPTY_PATH 0x00000004 /* Empty from path permitted */
++#endif
++
++#ifndef MOVE_MOUNT_T_EMPTY_PATH
++#define MOVE_MOUNT_T_EMPTY_PATH 0x00000040 /* Empty to path permitted */
++#endif
++
++static inline int missing_move_mount(
++                int from_dfd,
++                const char *from_pathname,
++                int to_dfd,
++                const char *to_pathname,
++                unsigned flags) {
++
++#  if defined __NR_move_mount && __NR_move_mount >= 0
++        return syscall(__NR_move_mount, from_dfd, from_pathname, to_dfd, to_pathname, flags);
++#  else
++        errno = ENOSYS;
++        return -1;
++#  endif
++}
++
++#  define move_mount missing_move_mount
++#endif
++
++/* ======================================================================= */
++
++#if !HAVE_FSOPEN
++
++#ifndef FSOPEN_CLOEXEC
++#define FSOPEN_CLOEXEC 0x00000001
++#endif
++
++static inline int missing_fsopen(const char *fsname, unsigned flags) {
++#  if defined __NR_fsopen && __NR_fsopen >= 0
++        return syscall(__NR_fsopen, fsname, flags);
++#  else
++        errno = ENOSYS;
++        return -1;
++#  endif
++}
++
++#  define fsopen missing_fsopen
++#endif
++
++/* ======================================================================= */
++
++#if !HAVE_FSCONFIG
++
++#ifndef FSCONFIG_SET_FLAG
++#define FSCONFIG_SET_FLAG 0 /* Set parameter, supplying no value */
++#endif
++
++#ifndef FSCONFIG_SET_STRING
++#define FSCONFIG_SET_STRING 1 /* Set parameter, supplying a string value */
++#endif
++
++#ifndef FSCONFIG_SET_FD
++#define FSCONFIG_SET_FD 5 /* Set parameter, supplying an object by fd */
++#endif
++
++#ifndef FSCONFIG_CMD_CREATE
++#define FSCONFIG_CMD_CREATE 6 /* Invoke superblock creation */
++#endif
++
++static inline int missing_fsconfig(int fd, unsigned cmd, const char *key, const void *value, int aux) {
++#  if defined __NR_fsconfig && __NR_fsconfig >= 0
++        return syscall(__NR_fsconfig, fd, cmd, key, value, aux);
++#  else
++        errno = ENOSYS;
++        return -1;
++#  endif
++}
++
++#  define fsconfig missing_fsconfig
++#endif
++
++/* ======================================================================= */
++
++#if !HAVE_FSMOUNT
++
++#ifndef FSMOUNT_CLOEXEC
++#define FSMOUNT_CLOEXEC 0x00000001
++#endif
++
++static inline int missing_fsmount(int fd, unsigned flags, unsigned ms_flags) {
++#  if defined __NR_fsmount && __NR_fsmount >= 0
++        return syscall(__NR_fsmount, fd, flags, ms_flags);
++#  else
++        errno = ENOSYS;
++        return -1;
++#  endif
++}
++
++#  define fsmount missing_fsmount
++#endif
++
++/* ======================================================================= */
++
++#if !HAVE_GETDENTS64
++
++static inline ssize_t missing_getdents64(int fd, void *buffer, size_t length) {
++#  if defined __NR_getdents64 && __NR_getdents64 >= 0
++        return syscall(__NR_getdents64, fd, buffer, length);
++#  else
++        errno = ENOSYS;
++        return -1;
++#  endif
++}
++
++#  define getdents64 missing_getdents64
++#endif
++
++/* ======================================================================= */
++
++#if !HAVE_SCHED_SETATTR
++
++static inline ssize_t missing_sched_setattr(pid_t pid, struct sched_attr *attr, unsigned int flags) {
++        return syscall(__NR_sched_setattr, pid, attr, flags);
++}
++
++#  define sched_setattr missing_sched_setattr
++#endif
++
++/* ======================================================================= */
++
++/* glibc does not provide clone() on ia64, only clone2(). Not only that, but it also doesn't provide a
++ * prototype, only the symbol in the shared library (it provides a prototype for clone(), but not the
++ * symbol in the shared library). */
++#if defined(__ia64__)
++int __clone2(int (*fn)(void *), void *stack_base, size_t stack_size, int flags, void *arg);
++#define HAVE_CLONE 0
++#else
++/* We know that everywhere else clone() is available, so we don't bother with a meson check (that takes time
++ * at build time) and just define it. Once the kernel drops ia64 support, we can drop this too. */
++#define HAVE_CLONE 1
++#endif
++
++/* ======================================================================= */
++
++#if !HAVE_QUOTACTL_FD
++
++static inline int missing_quotactl_fd(int fd, int cmd, int id, void *addr) {
++#  ifdef __NR_quotactl_fd
++        return syscall(__NR_quotactl_fd, fd, cmd, id, addr);
++#  else
++        errno = ENOSYS;
++        return -1;
++#  endif
++}
++
++#  define quotactl_fd missing_quotactl_fd
++#endif
++
++/* ======================================================================= */
++
++#if !HAVE_SETXATTRAT
++struct xattr_args {
++        _align_(8) uint64_t value;
++        uint32_t size;
++        uint32_t flags;
++};
++
++static inline int missing_setxattrat(int fd, const char *path, int at_flags, const char *name, const struct xattr_args *args, size_t size) {
++#  ifdef __NR_setxattrat
++        return syscall(__NR_setxattrat, fd, path, at_flags, name, args, size);
++#  else
++        errno = ENOSYS;
++        return -1;
++#  endif
++}
++
++#  define setxattrat missing_setxattrat
++#endif
++
++#if !HAVE_REMOVEXATTRAT
++static inline int missing_removexattrat(int fd, const char *path, int at_flags, const char *name) {
++#  ifdef __NR_removexattrat
++        return syscall(__NR_removexattrat, fd, path, at_flags, name);
++#  else
++        errno = ENOSYS;
++        return -1;
++#  endif
++}
++
++#  define removexattrat missing_removexattrat
++#endif
+diff --git a/src/basic/missing_syscall_def.h b/src/basic/missing_syscall_def.h
+new file mode 100644
+index 0000000000..48116fc0f7
+--- /dev/null
++++ b/src/basic/missing_syscall_def.h
+@@ -0,0 +1,1403 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later
++ * This file is generated by src/basic/missing_syscalls.py. Do not edit!
++ *
++ * Use 'ninja -C build update-syscall-tables' to download new syscall tables,
++ * and 'ninja -C build update-syscall-header' to regenerate this file.
++ */
++#pragma once
++
++/* Note: if this code looks strange, this is because it is derived from the same
++ * template as the per-syscall blocks below. */
++#  if defined(__aarch64__)
++#  elif defined(__alpha__)
++#  elif defined(__arc__) || defined(__tilegx__)
++#  elif defined(__arm__)
++#  elif defined(__i386__)
++#  elif defined(__ia64__)
++#  elif defined(__loongarch_lp64)
++#  elif defined(__m68k__)
++#  elif defined(_MIPS_SIM)
++#    if _MIPS_SIM == _MIPS_SIM_ABI32
++#    elif _MIPS_SIM == _MIPS_SIM_NABI32
++#    elif _MIPS_SIM == _MIPS_SIM_ABI64
++#    else
++#      error "Unknown MIPS ABI"
++#    endif
++#  elif defined(__hppa__)
++#  elif defined(__powerpc__)
++#  elif defined(__riscv)
++#    if __riscv_xlen == 32
++#    elif __riscv_xlen == 64
++#    else
++#      error "Unknown RISC-V ABI"
++#    endif
++#  elif defined(__s390__)
++#  elif defined(__sparc__)
++#  elif defined(__x86_64__)
++#    if defined(__ILP32__)
++#    else
++#    endif
++#  elif !defined(missing_arch_template)
++#    warning "Current architecture is missing from the template"
++#    define missing_arch_template 1
++#  endif
++
++#ifndef __IGNORE_bpf
++#  if defined(__aarch64__)
++#    define systemd_NR_bpf 280
++#  elif defined(__alpha__)
++#    define systemd_NR_bpf 515
++#  elif defined(__arc__) || defined(__tilegx__)
++#    define systemd_NR_bpf 280
++#  elif defined(__arm__)
++#    define systemd_NR_bpf 386
++#  elif defined(__i386__)
++#    define systemd_NR_bpf 357
++#  elif defined(__ia64__)
++#    define systemd_NR_bpf 1341
++#  elif defined(__loongarch_lp64)
++#    define systemd_NR_bpf 280
++#  elif defined(__m68k__)
++#    define systemd_NR_bpf 354
++#  elif defined(_MIPS_SIM)
++#    if _MIPS_SIM == _MIPS_SIM_ABI32
++#      define systemd_NR_bpf 4355
++#    elif _MIPS_SIM == _MIPS_SIM_NABI32
++#      define systemd_NR_bpf 6319
++#    elif _MIPS_SIM == _MIPS_SIM_ABI64
++#      define systemd_NR_bpf 5315
++#    else
++#      error "Unknown MIPS ABI"
++#    endif
++#  elif defined(__hppa__)
++#    define systemd_NR_bpf 341
++#  elif defined(__powerpc__)
++#    define systemd_NR_bpf 361
++#  elif defined(__riscv)
++#    if __riscv_xlen == 32
++#      define systemd_NR_bpf 280
++#    elif __riscv_xlen == 64
++#      define systemd_NR_bpf 280
++#    else
++#      error "Unknown RISC-V ABI"
++#    endif
++#  elif defined(__s390__)
++#    define systemd_NR_bpf 351
++#  elif defined(__sparc__)
++#    define systemd_NR_bpf 349
++#  elif defined(__x86_64__)
++#    if defined(__ILP32__)
++#      define systemd_NR_bpf (321 | /* __X32_SYSCALL_BIT */ 0x40000000)
++#    else
++#      define systemd_NR_bpf 321
++#    endif
++#  elif !defined(missing_arch_template)
++#    warning "bpf() syscall number is unknown for your architecture"
++#  endif
++
++/* may be an (invalid) negative number due to libseccomp, see PR 13319 */
++#  if defined __NR_bpf && __NR_bpf >= 0
++#    if defined systemd_NR_bpf
++assert_cc(__NR_bpf == systemd_NR_bpf);
++#    endif
++#  else
++#    if defined __NR_bpf
++#      undef __NR_bpf
++#    endif
++#    if defined systemd_NR_bpf && systemd_NR_bpf >= 0
++#      define __NR_bpf systemd_NR_bpf
++#    endif
++#  endif
++#endif
++
++#ifndef __IGNORE_close_range
++#  if defined(__aarch64__)
++#    define systemd_NR_close_range 436
++#  elif defined(__alpha__)
++#    define systemd_NR_close_range 546
++#  elif defined(__arc__) || defined(__tilegx__)
++#    define systemd_NR_close_range 436
++#  elif defined(__arm__)
++#    define systemd_NR_close_range 436
++#  elif defined(__i386__)
++#    define systemd_NR_close_range 436
++#  elif defined(__ia64__)
++#    define systemd_NR_close_range 1460
++#  elif defined(__loongarch_lp64)
++#    define systemd_NR_close_range 436
++#  elif defined(__m68k__)
++#    define systemd_NR_close_range 436
++#  elif defined(_MIPS_SIM)
++#    if _MIPS_SIM == _MIPS_SIM_ABI32
++#      define systemd_NR_close_range 4436
++#    elif _MIPS_SIM == _MIPS_SIM_NABI32
++#      define systemd_NR_close_range 6436
++#    elif _MIPS_SIM == _MIPS_SIM_ABI64
++#      define systemd_NR_close_range 5436
++#    else
++#      error "Unknown MIPS ABI"
++#    endif
++#  elif defined(__hppa__)
++#    define systemd_NR_close_range 436
++#  elif defined(__powerpc__)
++#    define systemd_NR_close_range 436
++#  elif defined(__riscv)
++#    if __riscv_xlen == 32
++#      define systemd_NR_close_range 436
++#    elif __riscv_xlen == 64
++#      define systemd_NR_close_range 436
++#    else
++#      error "Unknown RISC-V ABI"
++#    endif
++#  elif defined(__s390__)
++#    define systemd_NR_close_range 436
++#  elif defined(__sparc__)
++#    define systemd_NR_close_range 436
++#  elif defined(__x86_64__)
++#    if defined(__ILP32__)
++#      define systemd_NR_close_range (436 | /* __X32_SYSCALL_BIT */ 0x40000000)
++#    else
++#      define systemd_NR_close_range 436
++#    endif
++#  elif !defined(missing_arch_template)
++#    warning "close_range() syscall number is unknown for your architecture"
++#  endif
++
++/* may be an (invalid) negative number due to libseccomp, see PR 13319 */
++#  if defined __NR_close_range && __NR_close_range >= 0
++#    if defined systemd_NR_close_range
++assert_cc(__NR_close_range == systemd_NR_close_range);
++#    endif
++#  else
++#    if defined __NR_close_range
++#      undef __NR_close_range
++#    endif
++#    if defined systemd_NR_close_range && systemd_NR_close_range >= 0
++#      define __NR_close_range systemd_NR_close_range
++#    endif
++#  endif
++#endif
++
++#ifndef __IGNORE_copy_file_range
++#  if defined(__aarch64__)
++#    define systemd_NR_copy_file_range 285
++#  elif defined(__alpha__)
++#    define systemd_NR_copy_file_range 519
++#  elif defined(__arc__) || defined(__tilegx__)
++#    define systemd_NR_copy_file_range 285
++#  elif defined(__arm__)
++#    define systemd_NR_copy_file_range 391
++#  elif defined(__i386__)
++#    define systemd_NR_copy_file_range 377
++#  elif defined(__ia64__)
++#    define systemd_NR_copy_file_range 1347
++#  elif defined(__loongarch_lp64)
++#    define systemd_NR_copy_file_range 285
++#  elif defined(__m68k__)
++#    define systemd_NR_copy_file_range 376
++#  elif defined(_MIPS_SIM)
++#    if _MIPS_SIM == _MIPS_SIM_ABI32
++#      define systemd_NR_copy_file_range 4360
++#    elif _MIPS_SIM == _MIPS_SIM_NABI32
++#      define systemd_NR_copy_file_range 6324
++#    elif _MIPS_SIM == _MIPS_SIM_ABI64
++#      define systemd_NR_copy_file_range 5320
++#    else
++#      error "Unknown MIPS ABI"
++#    endif
++#  elif defined(__hppa__)
++#    define systemd_NR_copy_file_range 346
++#  elif defined(__powerpc__)
++#    define systemd_NR_copy_file_range 379
++#  elif defined(__riscv)
++#    if __riscv_xlen == 32
++#      define systemd_NR_copy_file_range 285
++#    elif __riscv_xlen == 64
++#      define systemd_NR_copy_file_range 285
++#    else
++#      error "Unknown RISC-V ABI"
++#    endif
++#  elif defined(__s390__)
++#    define systemd_NR_copy_file_range 375
++#  elif defined(__sparc__)
++#    define systemd_NR_copy_file_range 357
++#  elif defined(__x86_64__)
++#    if defined(__ILP32__)
++#      define systemd_NR_copy_file_range (326 | /* __X32_SYSCALL_BIT */ 0x40000000)
++#    else
++#      define systemd_NR_copy_file_range 326
++#    endif
++#  elif !defined(missing_arch_template)
++#    warning "copy_file_range() syscall number is unknown for your architecture"
++#  endif
++
++/* may be an (invalid) negative number due to libseccomp, see PR 13319 */
++#  if defined __NR_copy_file_range && __NR_copy_file_range >= 0
++#    if defined systemd_NR_copy_file_range
++assert_cc(__NR_copy_file_range == systemd_NR_copy_file_range);
++#    endif
++#  else
++#    if defined __NR_copy_file_range
++#      undef __NR_copy_file_range
++#    endif
++#    if defined systemd_NR_copy_file_range && systemd_NR_copy_file_range >= 0
++#      define __NR_copy_file_range systemd_NR_copy_file_range
++#    endif
++#  endif
++#endif
++
++#ifndef __IGNORE_fchmodat2
++#  if defined(__aarch64__)
++#    define systemd_NR_fchmodat2 452
++#  elif defined(__alpha__)
++#    define systemd_NR_fchmodat2 562
++#  elif defined(__arc__) || defined(__tilegx__)
++#    define systemd_NR_fchmodat2 452
++#  elif defined(__arm__)
++#    define systemd_NR_fchmodat2 452
++#  elif defined(__i386__)
++#    define systemd_NR_fchmodat2 452
++#  elif defined(__ia64__)
++#    define systemd_NR_fchmodat2 1476
++#  elif defined(__loongarch_lp64)
++#    define systemd_NR_fchmodat2 452
++#  elif defined(__m68k__)
++#    define systemd_NR_fchmodat2 452
++#  elif defined(_MIPS_SIM)
++#    if _MIPS_SIM == _MIPS_SIM_ABI32
++#      define systemd_NR_fchmodat2 4452
++#    elif _MIPS_SIM == _MIPS_SIM_NABI32
++#      define systemd_NR_fchmodat2 6452
++#    elif _MIPS_SIM == _MIPS_SIM_ABI64
++#      define systemd_NR_fchmodat2 5452
++#    else
++#      error "Unknown MIPS ABI"
++#    endif
++#  elif defined(__hppa__)
++#    define systemd_NR_fchmodat2 452
++#  elif defined(__powerpc__)
++#    define systemd_NR_fchmodat2 452
++#  elif defined(__riscv)
++#    if __riscv_xlen == 32
++#      define systemd_NR_fchmodat2 452
++#    elif __riscv_xlen == 64
++#      define systemd_NR_fchmodat2 452
++#    else
++#      error "Unknown RISC-V ABI"
++#    endif
++#  elif defined(__s390__)
++#    define systemd_NR_fchmodat2 452
++#  elif defined(__sparc__)
++#    define systemd_NR_fchmodat2 452
++#  elif defined(__x86_64__)
++#    if defined(__ILP32__)
++#      define systemd_NR_fchmodat2 (452 | /* __X32_SYSCALL_BIT */ 0x40000000)
++#    else
++#      define systemd_NR_fchmodat2 452
++#    endif
++#  elif !defined(missing_arch_template)
++#    warning "fchmodat2() syscall number is unknown for your architecture"
++#  endif
++
++/* may be an (invalid) negative number due to libseccomp, see PR 13319 */
++#  if defined __NR_fchmodat2 && __NR_fchmodat2 >= 0
++#    if defined systemd_NR_fchmodat2
++assert_cc(__NR_fchmodat2 == systemd_NR_fchmodat2);
++#    endif
++#  else
++#    if defined __NR_fchmodat2
++#      undef __NR_fchmodat2
++#    endif
++#    if defined systemd_NR_fchmodat2 && systemd_NR_fchmodat2 >= 0
++#      define __NR_fchmodat2 systemd_NR_fchmodat2
++#    endif
++#  endif
++#endif
++
++#ifndef __IGNORE_getrandom
++#  if defined(__aarch64__)
++#    define systemd_NR_getrandom 278
++#  elif defined(__alpha__)
++#    define systemd_NR_getrandom 511
++#  elif defined(__arc__) || defined(__tilegx__)
++#    define systemd_NR_getrandom 278
++#  elif defined(__arm__)
++#    define systemd_NR_getrandom 384
++#  elif defined(__i386__)
++#    define systemd_NR_getrandom 355
++#  elif defined(__ia64__)
++#    define systemd_NR_getrandom 1339
++#  elif defined(__loongarch_lp64)
++#    define systemd_NR_getrandom 278
++#  elif defined(__m68k__)
++#    define systemd_NR_getrandom 352
++#  elif defined(_MIPS_SIM)
++#    if _MIPS_SIM == _MIPS_SIM_ABI32
++#      define systemd_NR_getrandom 4353
++#    elif _MIPS_SIM == _MIPS_SIM_NABI32
++#      define systemd_NR_getrandom 6317
++#    elif _MIPS_SIM == _MIPS_SIM_ABI64
++#      define systemd_NR_getrandom 5313
++#    else
++#      error "Unknown MIPS ABI"
++#    endif
++#  elif defined(__hppa__)
++#    define systemd_NR_getrandom 339
++#  elif defined(__powerpc__)
++#    define systemd_NR_getrandom 359
++#  elif defined(__riscv)
++#    if __riscv_xlen == 32
++#      define systemd_NR_getrandom 278
++#    elif __riscv_xlen == 64
++#      define systemd_NR_getrandom 278
++#    else
++#      error "Unknown RISC-V ABI"
++#    endif
++#  elif defined(__s390__)
++#    define systemd_NR_getrandom 349
++#  elif defined(__sparc__)
++#    define systemd_NR_getrandom 347
++#  elif defined(__x86_64__)
++#    if defined(__ILP32__)
++#      define systemd_NR_getrandom (318 | /* __X32_SYSCALL_BIT */ 0x40000000)
++#    else
++#      define systemd_NR_getrandom 318
++#    endif
++#  elif !defined(missing_arch_template)
++#    warning "getrandom() syscall number is unknown for your architecture"
++#  endif
++
++/* may be an (invalid) negative number due to libseccomp, see PR 13319 */
++#  if defined __NR_getrandom && __NR_getrandom >= 0
++#    if defined systemd_NR_getrandom
++assert_cc(__NR_getrandom == systemd_NR_getrandom);
++#    endif
++#  else
++#    if defined __NR_getrandom
++#      undef __NR_getrandom
++#    endif
++#    if defined systemd_NR_getrandom && systemd_NR_getrandom >= 0
++#      define __NR_getrandom systemd_NR_getrandom
++#    endif
++#  endif
++#endif
++
++#ifndef __IGNORE_memfd_create
++#  if defined(__aarch64__)
++#    define systemd_NR_memfd_create 279
++#  elif defined(__alpha__)
++#    define systemd_NR_memfd_create 512
++#  elif defined(__arc__) || defined(__tilegx__)
++#    define systemd_NR_memfd_create 279
++#  elif defined(__arm__)
++#    define systemd_NR_memfd_create 385
++#  elif defined(__i386__)
++#    define systemd_NR_memfd_create 356
++#  elif defined(__ia64__)
++#    define systemd_NR_memfd_create 1340
++#  elif defined(__loongarch_lp64)
++#    define systemd_NR_memfd_create 279
++#  elif defined(__m68k__)
++#    define systemd_NR_memfd_create 353
++#  elif defined(_MIPS_SIM)
++#    if _MIPS_SIM == _MIPS_SIM_ABI32
++#      define systemd_NR_memfd_create 4354
++#    elif _MIPS_SIM == _MIPS_SIM_NABI32
++#      define systemd_NR_memfd_create 6318
++#    elif _MIPS_SIM == _MIPS_SIM_ABI64
++#      define systemd_NR_memfd_create 5314
++#    else
++#      error "Unknown MIPS ABI"
++#    endif
++#  elif defined(__hppa__)
++#    define systemd_NR_memfd_create 340
++#  elif defined(__powerpc__)
++#    define systemd_NR_memfd_create 360
++#  elif defined(__riscv)
++#    if __riscv_xlen == 32
++#      define systemd_NR_memfd_create 279
++#    elif __riscv_xlen == 64
++#      define systemd_NR_memfd_create 279
++#    else
++#      error "Unknown RISC-V ABI"
++#    endif
++#  elif defined(__s390__)
++#    define systemd_NR_memfd_create 350
++#  elif defined(__sparc__)
++#    define systemd_NR_memfd_create 348
++#  elif defined(__x86_64__)
++#    if defined(__ILP32__)
++#      define systemd_NR_memfd_create (319 | /* __X32_SYSCALL_BIT */ 0x40000000)
++#    else
++#      define systemd_NR_memfd_create 319
++#    endif
++#  elif !defined(missing_arch_template)
++#    warning "memfd_create() syscall number is unknown for your architecture"
++#  endif
++
++/* may be an (invalid) negative number due to libseccomp, see PR 13319 */
++#  if defined __NR_memfd_create && __NR_memfd_create >= 0
++#    if defined systemd_NR_memfd_create
++assert_cc(__NR_memfd_create == systemd_NR_memfd_create);
++#    endif
++#  else
++#    if defined __NR_memfd_create
++#      undef __NR_memfd_create
++#    endif
++#    if defined systemd_NR_memfd_create && systemd_NR_memfd_create >= 0
++#      define __NR_memfd_create systemd_NR_memfd_create
++#    endif
++#  endif
++#endif
++
++#ifndef __IGNORE_mount_setattr
++#  if defined(__aarch64__)
++#    define systemd_NR_mount_setattr 442
++#  elif defined(__alpha__)
++#    define systemd_NR_mount_setattr 552
++#  elif defined(__arc__) || defined(__tilegx__)
++#    define systemd_NR_mount_setattr 442
++#  elif defined(__arm__)
++#    define systemd_NR_mount_setattr 442
++#  elif defined(__i386__)
++#    define systemd_NR_mount_setattr 442
++#  elif defined(__ia64__)
++#    define systemd_NR_mount_setattr 1466
++#  elif defined(__loongarch_lp64)
++#    define systemd_NR_mount_setattr 442
++#  elif defined(__m68k__)
++#    define systemd_NR_mount_setattr 442
++#  elif defined(_MIPS_SIM)
++#    if _MIPS_SIM == _MIPS_SIM_ABI32
++#      define systemd_NR_mount_setattr 4442
++#    elif _MIPS_SIM == _MIPS_SIM_NABI32
++#      define systemd_NR_mount_setattr 6442
++#    elif _MIPS_SIM == _MIPS_SIM_ABI64
++#      define systemd_NR_mount_setattr 5442
++#    else
++#      error "Unknown MIPS ABI"
++#    endif
++#  elif defined(__hppa__)
++#    define systemd_NR_mount_setattr 442
++#  elif defined(__powerpc__)
++#    define systemd_NR_mount_setattr 442
++#  elif defined(__riscv)
++#    if __riscv_xlen == 32
++#      define systemd_NR_mount_setattr 442
++#    elif __riscv_xlen == 64
++#      define systemd_NR_mount_setattr 442
++#    else
++#      error "Unknown RISC-V ABI"
++#    endif
++#  elif defined(__s390__)
++#    define systemd_NR_mount_setattr 442
++#  elif defined(__sparc__)
++#    define systemd_NR_mount_setattr 442
++#  elif defined(__x86_64__)
++#    if defined(__ILP32__)
++#      define systemd_NR_mount_setattr (442 | /* __X32_SYSCALL_BIT */ 0x40000000)
++#    else
++#      define systemd_NR_mount_setattr 442
++#    endif
++#  elif !defined(missing_arch_template)
++#    warning "mount_setattr() syscall number is unknown for your architecture"
++#  endif
++
++/* may be an (invalid) negative number due to libseccomp, see PR 13319 */
++#  if defined __NR_mount_setattr && __NR_mount_setattr >= 0
++#    if defined systemd_NR_mount_setattr
++assert_cc(__NR_mount_setattr == systemd_NR_mount_setattr);
++#    endif
++#  else
++#    if defined __NR_mount_setattr
++#      undef __NR_mount_setattr
++#    endif
++#    if defined systemd_NR_mount_setattr && systemd_NR_mount_setattr >= 0
++#      define __NR_mount_setattr systemd_NR_mount_setattr
++#    endif
++#  endif
++#endif
++
++#ifndef __IGNORE_move_mount
++#  if defined(__aarch64__)
++#    define systemd_NR_move_mount 429
++#  elif defined(__alpha__)
++#    define systemd_NR_move_mount 539
++#  elif defined(__arc__) || defined(__tilegx__)
++#    define systemd_NR_move_mount 429
++#  elif defined(__arm__)
++#    define systemd_NR_move_mount 429
++#  elif defined(__i386__)
++#    define systemd_NR_move_mount 429
++#  elif defined(__ia64__)
++#    define systemd_NR_move_mount 1453
++#  elif defined(__loongarch_lp64)
++#    define systemd_NR_move_mount 429
++#  elif defined(__m68k__)
++#    define systemd_NR_move_mount 429
++#  elif defined(_MIPS_SIM)
++#    if _MIPS_SIM == _MIPS_SIM_ABI32
++#      define systemd_NR_move_mount 4429
++#    elif _MIPS_SIM == _MIPS_SIM_NABI32
++#      define systemd_NR_move_mount 6429
++#    elif _MIPS_SIM == _MIPS_SIM_ABI64
++#      define systemd_NR_move_mount 5429
++#    else
++#      error "Unknown MIPS ABI"
++#    endif
++#  elif defined(__hppa__)
++#    define systemd_NR_move_mount 429
++#  elif defined(__powerpc__)
++#    define systemd_NR_move_mount 429
++#  elif defined(__riscv)
++#    if __riscv_xlen == 32
++#      define systemd_NR_move_mount 429
++#    elif __riscv_xlen == 64
++#      define systemd_NR_move_mount 429
++#    else
++#      error "Unknown RISC-V ABI"
++#    endif
++#  elif defined(__s390__)
++#    define systemd_NR_move_mount 429
++#  elif defined(__sparc__)
++#    define systemd_NR_move_mount 429
++#  elif defined(__x86_64__)
++#    if defined(__ILP32__)
++#      define systemd_NR_move_mount (429 | /* __X32_SYSCALL_BIT */ 0x40000000)
++#    else
++#      define systemd_NR_move_mount 429
++#    endif
++#  elif !defined(missing_arch_template)
++#    warning "move_mount() syscall number is unknown for your architecture"
++#  endif
++
++/* may be an (invalid) negative number due to libseccomp, see PR 13319 */
++#  if defined __NR_move_mount && __NR_move_mount >= 0
++#    if defined systemd_NR_move_mount
++assert_cc(__NR_move_mount == systemd_NR_move_mount);
++#    endif
++#  else
++#    if defined __NR_move_mount
++#      undef __NR_move_mount
++#    endif
++#    if defined systemd_NR_move_mount && systemd_NR_move_mount >= 0
++#      define __NR_move_mount systemd_NR_move_mount
++#    endif
++#  endif
++#endif
++
++#ifndef __IGNORE_name_to_handle_at
++#  if defined(__aarch64__)
++#    define systemd_NR_name_to_handle_at 264
++#  elif defined(__alpha__)
++#    define systemd_NR_name_to_handle_at 497
++#  elif defined(__arc__) || defined(__tilegx__)
++#    define systemd_NR_name_to_handle_at 264
++#  elif defined(__arm__)
++#    define systemd_NR_name_to_handle_at 370
++#  elif defined(__i386__)
++#    define systemd_NR_name_to_handle_at 341
++#  elif defined(__ia64__)
++#    define systemd_NR_name_to_handle_at 1326
++#  elif defined(__loongarch_lp64)
++#    define systemd_NR_name_to_handle_at 264
++#  elif defined(__m68k__)
++#    define systemd_NR_name_to_handle_at 340
++#  elif defined(_MIPS_SIM)
++#    if _MIPS_SIM == _MIPS_SIM_ABI32
++#      define systemd_NR_name_to_handle_at 4339
++#    elif _MIPS_SIM == _MIPS_SIM_NABI32
++#      define systemd_NR_name_to_handle_at 6303
++#    elif _MIPS_SIM == _MIPS_SIM_ABI64
++#      define systemd_NR_name_to_handle_at 5298
++#    else
++#      error "Unknown MIPS ABI"
++#    endif
++#  elif defined(__hppa__)
++#    define systemd_NR_name_to_handle_at 325
++#  elif defined(__powerpc__)
++#    define systemd_NR_name_to_handle_at 345
++#  elif defined(__riscv)
++#    if __riscv_xlen == 32
++#      define systemd_NR_name_to_handle_at 264
++#    elif __riscv_xlen == 64
++#      define systemd_NR_name_to_handle_at 264
++#    else
++#      error "Unknown RISC-V ABI"
++#    endif
++#  elif defined(__s390__)
++#    define systemd_NR_name_to_handle_at 335
++#  elif defined(__sparc__)
++#    define systemd_NR_name_to_handle_at 332
++#  elif defined(__x86_64__)
++#    if defined(__ILP32__)
++#      define systemd_NR_name_to_handle_at (303 | /* __X32_SYSCALL_BIT */ 0x40000000)
++#    else
++#      define systemd_NR_name_to_handle_at 303
++#    endif
++#  elif !defined(missing_arch_template)
++#    warning "name_to_handle_at() syscall number is unknown for your architecture"
++#  endif
++
++/* may be an (invalid) negative number due to libseccomp, see PR 13319 */
++#  if defined __NR_name_to_handle_at && __NR_name_to_handle_at >= 0
++#    if defined systemd_NR_name_to_handle_at
++assert_cc(__NR_name_to_handle_at == systemd_NR_name_to_handle_at);
++#    endif
++#  else
++#    if defined __NR_name_to_handle_at
++#      undef __NR_name_to_handle_at
++#    endif
++#    if defined systemd_NR_name_to_handle_at && systemd_NR_name_to_handle_at >= 0
++#      define __NR_name_to_handle_at systemd_NR_name_to_handle_at
++#    endif
++#  endif
++#endif
++
++#ifndef __IGNORE_open_tree
++#  if defined(__aarch64__)
++#    define systemd_NR_open_tree 428
++#  elif defined(__alpha__)
++#    define systemd_NR_open_tree 538
++#  elif defined(__arc__) || defined(__tilegx__)
++#    define systemd_NR_open_tree 428
++#  elif defined(__arm__)
++#    define systemd_NR_open_tree 428
++#  elif defined(__i386__)
++#    define systemd_NR_open_tree 428
++#  elif defined(__ia64__)
++#    define systemd_NR_open_tree 1452
++#  elif defined(__loongarch_lp64)
++#    define systemd_NR_open_tree 428
++#  elif defined(__m68k__)
++#    define systemd_NR_open_tree 428
++#  elif defined(_MIPS_SIM)
++#    if _MIPS_SIM == _MIPS_SIM_ABI32
++#      define systemd_NR_open_tree 4428
++#    elif _MIPS_SIM == _MIPS_SIM_NABI32
++#      define systemd_NR_open_tree 6428
++#    elif _MIPS_SIM == _MIPS_SIM_ABI64
++#      define systemd_NR_open_tree 5428
++#    else
++#      error "Unknown MIPS ABI"
++#    endif
++#  elif defined(__hppa__)
++#    define systemd_NR_open_tree 428
++#  elif defined(__powerpc__)
++#    define systemd_NR_open_tree 428
++#  elif defined(__riscv)
++#    if __riscv_xlen == 32
++#      define systemd_NR_open_tree 428
++#    elif __riscv_xlen == 64
++#      define systemd_NR_open_tree 428
++#    else
++#      error "Unknown RISC-V ABI"
++#    endif
++#  elif defined(__s390__)
++#    define systemd_NR_open_tree 428
++#  elif defined(__sparc__)
++#    define systemd_NR_open_tree 428
++#  elif defined(__x86_64__)
++#    if defined(__ILP32__)
++#      define systemd_NR_open_tree (428 | /* __X32_SYSCALL_BIT */ 0x40000000)
++#    else
++#      define systemd_NR_open_tree 428
++#    endif
++#  elif !defined(missing_arch_template)
++#    warning "open_tree() syscall number is unknown for your architecture"
++#  endif
++
++/* may be an (invalid) negative number due to libseccomp, see PR 13319 */
++#  if defined __NR_open_tree && __NR_open_tree >= 0
++#    if defined systemd_NR_open_tree
++assert_cc(__NR_open_tree == systemd_NR_open_tree);
++#    endif
++#  else
++#    if defined __NR_open_tree
++#      undef __NR_open_tree
++#    endif
++#    if defined systemd_NR_open_tree && systemd_NR_open_tree >= 0
++#      define __NR_open_tree systemd_NR_open_tree
++#    endif
++#  endif
++#endif
++
++#ifndef __IGNORE_openat2
++#  if defined(__aarch64__)
++#    define systemd_NR_openat2 437
++#  elif defined(__alpha__)
++#    define systemd_NR_openat2 547
++#  elif defined(__arc__) || defined(__tilegx__)
++#    define systemd_NR_openat2 437
++#  elif defined(__arm__)
++#    define systemd_NR_openat2 437
++#  elif defined(__i386__)
++#    define systemd_NR_openat2 437
++#  elif defined(__ia64__)
++#    define systemd_NR_openat2 1461
++#  elif defined(__loongarch_lp64)
++#    define systemd_NR_openat2 437
++#  elif defined(__m68k__)
++#    define systemd_NR_openat2 437
++#  elif defined(_MIPS_SIM)
++#    if _MIPS_SIM == _MIPS_SIM_ABI32
++#      define systemd_NR_openat2 4437
++#    elif _MIPS_SIM == _MIPS_SIM_NABI32
++#      define systemd_NR_openat2 6437
++#    elif _MIPS_SIM == _MIPS_SIM_ABI64
++#      define systemd_NR_openat2 5437
++#    else
++#      error "Unknown MIPS ABI"
++#    endif
++#  elif defined(__hppa__)
++#    define systemd_NR_openat2 437
++#  elif defined(__powerpc__)
++#    define systemd_NR_openat2 437
++#  elif defined(__riscv)
++#    if __riscv_xlen == 32
++#      define systemd_NR_openat2 437
++#    elif __riscv_xlen == 64
++#      define systemd_NR_openat2 437
++#    else
++#      error "Unknown RISC-V ABI"
++#    endif
++#  elif defined(__s390__)
++#    define systemd_NR_openat2 437
++#  elif defined(__sparc__)
++#    define systemd_NR_openat2 437
++#  elif defined(__x86_64__)
++#    if defined(__ILP32__)
++#      define systemd_NR_openat2 (437 | /* __X32_SYSCALL_BIT */ 0x40000000)
++#    else
++#      define systemd_NR_openat2 437
++#    endif
++#  elif !defined(missing_arch_template)
++#    warning "openat2() syscall number is unknown for your architecture"
++#  endif
++
++/* may be an (invalid) negative number due to libseccomp, see PR 13319 */
++#  if defined __NR_openat2 && __NR_openat2 >= 0
++#    if defined systemd_NR_openat2
++assert_cc(__NR_openat2 == systemd_NR_openat2);
++#    endif
++#  else
++#    if defined __NR_openat2
++#      undef __NR_openat2
++#    endif
++#    if defined systemd_NR_openat2 && systemd_NR_openat2 >= 0
++#      define __NR_openat2 systemd_NR_openat2
++#    endif
++#  endif
++#endif
++
++#ifndef __IGNORE_pidfd_open
++#  if defined(__aarch64__)
++#    define systemd_NR_pidfd_open 434
++#  elif defined(__alpha__)
++#    define systemd_NR_pidfd_open 544
++#  elif defined(__arc__) || defined(__tilegx__)
++#    define systemd_NR_pidfd_open 434
++#  elif defined(__arm__)
++#    define systemd_NR_pidfd_open 434
++#  elif defined(__i386__)
++#    define systemd_NR_pidfd_open 434
++#  elif defined(__ia64__)
++#    define systemd_NR_pidfd_open 1458
++#  elif defined(__loongarch_lp64)
++#    define systemd_NR_pidfd_open 434
++#  elif defined(__m68k__)
++#    define systemd_NR_pidfd_open 434
++#  elif defined(_MIPS_SIM)
++#    if _MIPS_SIM == _MIPS_SIM_ABI32
++#      define systemd_NR_pidfd_open 4434
++#    elif _MIPS_SIM == _MIPS_SIM_NABI32
++#      define systemd_NR_pidfd_open 6434
++#    elif _MIPS_SIM == _MIPS_SIM_ABI64
++#      define systemd_NR_pidfd_open 5434
++#    else
++#      error "Unknown MIPS ABI"
++#    endif
++#  elif defined(__hppa__)
++#    define systemd_NR_pidfd_open 434
++#  elif defined(__powerpc__)
++#    define systemd_NR_pidfd_open 434
++#  elif defined(__riscv)
++#    if __riscv_xlen == 32
++#      define systemd_NR_pidfd_open 434
++#    elif __riscv_xlen == 64
++#      define systemd_NR_pidfd_open 434
++#    else
++#      error "Unknown RISC-V ABI"
++#    endif
++#  elif defined(__s390__)
++#    define systemd_NR_pidfd_open 434
++#  elif defined(__sparc__)
++#    define systemd_NR_pidfd_open 434
++#  elif defined(__x86_64__)
++#    if defined(__ILP32__)
++#      define systemd_NR_pidfd_open (434 | /* __X32_SYSCALL_BIT */ 0x40000000)
++#    else
++#      define systemd_NR_pidfd_open 434
++#    endif
++#  elif !defined(missing_arch_template)
++#    warning "pidfd_open() syscall number is unknown for your architecture"
++#  endif
++
++/* may be an (invalid) negative number due to libseccomp, see PR 13319 */
++#  if defined __NR_pidfd_open && __NR_pidfd_open >= 0
++#    if defined systemd_NR_pidfd_open
++assert_cc(__NR_pidfd_open == systemd_NR_pidfd_open);
++#    endif
++#  else
++#    if defined __NR_pidfd_open
++#      undef __NR_pidfd_open
++#    endif
++#    if defined systemd_NR_pidfd_open && systemd_NR_pidfd_open >= 0
++#      define __NR_pidfd_open systemd_NR_pidfd_open
++#    endif
++#  endif
++#endif
++
++#ifndef __IGNORE_pidfd_send_signal
++#  if defined(__aarch64__)
++#    define systemd_NR_pidfd_send_signal 424
++#  elif defined(__alpha__)
++#    define systemd_NR_pidfd_send_signal 534
++#  elif defined(__arc__) || defined(__tilegx__)
++#    define systemd_NR_pidfd_send_signal 424
++#  elif defined(__arm__)
++#    define systemd_NR_pidfd_send_signal 424
++#  elif defined(__i386__)
++#    define systemd_NR_pidfd_send_signal 424
++#  elif defined(__ia64__)
++#    define systemd_NR_pidfd_send_signal 1448
++#  elif defined(__loongarch_lp64)
++#    define systemd_NR_pidfd_send_signal 424
++#  elif defined(__m68k__)
++#    define systemd_NR_pidfd_send_signal 424
++#  elif defined(_MIPS_SIM)
++#    if _MIPS_SIM == _MIPS_SIM_ABI32
++#      define systemd_NR_pidfd_send_signal 4424
++#    elif _MIPS_SIM == _MIPS_SIM_NABI32
++#      define systemd_NR_pidfd_send_signal 6424
++#    elif _MIPS_SIM == _MIPS_SIM_ABI64
++#      define systemd_NR_pidfd_send_signal 5424
++#    else
++#      error "Unknown MIPS ABI"
++#    endif
++#  elif defined(__hppa__)
++#    define systemd_NR_pidfd_send_signal 424
++#  elif defined(__powerpc__)
++#    define systemd_NR_pidfd_send_signal 424
++#  elif defined(__riscv)
++#    if __riscv_xlen == 32
++#      define systemd_NR_pidfd_send_signal 424
++#    elif __riscv_xlen == 64
++#      define systemd_NR_pidfd_send_signal 424
++#    else
++#      error "Unknown RISC-V ABI"
++#    endif
++#  elif defined(__s390__)
++#    define systemd_NR_pidfd_send_signal 424
++#  elif defined(__sparc__)
++#    define systemd_NR_pidfd_send_signal 424
++#  elif defined(__x86_64__)
++#    if defined(__ILP32__)
++#      define systemd_NR_pidfd_send_signal (424 | /* __X32_SYSCALL_BIT */ 0x40000000)
++#    else
++#      define systemd_NR_pidfd_send_signal 424
++#    endif
++#  elif !defined(missing_arch_template)
++#    warning "pidfd_send_signal() syscall number is unknown for your architecture"
++#  endif
++
++/* may be an (invalid) negative number due to libseccomp, see PR 13319 */
++#  if defined __NR_pidfd_send_signal && __NR_pidfd_send_signal >= 0
++#    if defined systemd_NR_pidfd_send_signal
++assert_cc(__NR_pidfd_send_signal == systemd_NR_pidfd_send_signal);
++#    endif
++#  else
++#    if defined __NR_pidfd_send_signal
++#      undef __NR_pidfd_send_signal
++#    endif
++#    if defined systemd_NR_pidfd_send_signal && systemd_NR_pidfd_send_signal >= 0
++#      define __NR_pidfd_send_signal systemd_NR_pidfd_send_signal
++#    endif
++#  endif
++#endif
++
++#ifndef __IGNORE_pkey_mprotect
++#  if defined(__aarch64__)
++#    define systemd_NR_pkey_mprotect 288
++#  elif defined(__alpha__)
++#    define systemd_NR_pkey_mprotect 524
++#  elif defined(__arc__) || defined(__tilegx__)
++#    define systemd_NR_pkey_mprotect 288
++#  elif defined(__arm__)
++#    define systemd_NR_pkey_mprotect 394
++#  elif defined(__i386__)
++#    define systemd_NR_pkey_mprotect 380
++#  elif defined(__ia64__)
++#    define systemd_NR_pkey_mprotect 1354
++#  elif defined(__loongarch_lp64)
++#    define systemd_NR_pkey_mprotect 288
++#  elif defined(__m68k__)
++#    define systemd_NR_pkey_mprotect 381
++#  elif defined(_MIPS_SIM)
++#    if _MIPS_SIM == _MIPS_SIM_ABI32
++#      define systemd_NR_pkey_mprotect 4363
++#    elif _MIPS_SIM == _MIPS_SIM_NABI32
++#      define systemd_NR_pkey_mprotect 6327
++#    elif _MIPS_SIM == _MIPS_SIM_ABI64
++#      define systemd_NR_pkey_mprotect 5323
++#    else
++#      error "Unknown MIPS ABI"
++#    endif
++#  elif defined(__hppa__)
++#    define systemd_NR_pkey_mprotect 351
++#  elif defined(__powerpc__)
++#    define systemd_NR_pkey_mprotect 386
++#  elif defined(__riscv)
++#    if __riscv_xlen == 32
++#      define systemd_NR_pkey_mprotect 288
++#    elif __riscv_xlen == 64
++#      define systemd_NR_pkey_mprotect 288
++#    else
++#      error "Unknown RISC-V ABI"
++#    endif
++#  elif defined(__s390__)
++#    define systemd_NR_pkey_mprotect 384
++#  elif defined(__sparc__)
++#    define systemd_NR_pkey_mprotect 362
++#  elif defined(__x86_64__)
++#    if defined(__ILP32__)
++#      define systemd_NR_pkey_mprotect (329 | /* __X32_SYSCALL_BIT */ 0x40000000)
++#    else
++#      define systemd_NR_pkey_mprotect 329
++#    endif
++#  elif !defined(missing_arch_template)
++#    warning "pkey_mprotect() syscall number is unknown for your architecture"
++#  endif
++
++/* may be an (invalid) negative number due to libseccomp, see PR 13319 */
++#  if defined __NR_pkey_mprotect && __NR_pkey_mprotect >= 0
++#    if defined systemd_NR_pkey_mprotect
++assert_cc(__NR_pkey_mprotect == systemd_NR_pkey_mprotect);
++#    endif
++#  else
++#    if defined __NR_pkey_mprotect
++#      undef __NR_pkey_mprotect
++#    endif
++#    if defined systemd_NR_pkey_mprotect && systemd_NR_pkey_mprotect >= 0
++#      define __NR_pkey_mprotect systemd_NR_pkey_mprotect
++#    endif
++#  endif
++#endif
++
++#ifndef __IGNORE_quotactl_fd
++#  if defined(__aarch64__)
++#    define systemd_NR_quotactl_fd 443
++#  elif defined(__alpha__)
++#    define systemd_NR_quotactl_fd 553
++#  elif defined(__arc__) || defined(__tilegx__)
++#    define systemd_NR_quotactl_fd 443
++#  elif defined(__arm__)
++#    define systemd_NR_quotactl_fd 443
++#  elif defined(__i386__)
++#    define systemd_NR_quotactl_fd 443
++#  elif defined(__ia64__)
++#    define systemd_NR_quotactl_fd 1467
++#  elif defined(__loongarch_lp64)
++#    define systemd_NR_quotactl_fd 443
++#  elif defined(__m68k__)
++#    define systemd_NR_quotactl_fd 443
++#  elif defined(_MIPS_SIM)
++#    if _MIPS_SIM == _MIPS_SIM_ABI32
++#      define systemd_NR_quotactl_fd 4443
++#    elif _MIPS_SIM == _MIPS_SIM_NABI32
++#      define systemd_NR_quotactl_fd 6443
++#    elif _MIPS_SIM == _MIPS_SIM_ABI64
++#      define systemd_NR_quotactl_fd 5443
++#    else
++#      error "Unknown MIPS ABI"
++#    endif
++#  elif defined(__hppa__)
++#    define systemd_NR_quotactl_fd 443
++#  elif defined(__powerpc__)
++#    define systemd_NR_quotactl_fd 443
++#  elif defined(__riscv)
++#    if __riscv_xlen == 32
++#      define systemd_NR_quotactl_fd 443
++#    elif __riscv_xlen == 64
++#      define systemd_NR_quotactl_fd 443
++#    else
++#      error "Unknown RISC-V ABI"
++#    endif
++#  elif defined(__s390__)
++#    define systemd_NR_quotactl_fd 443
++#  elif defined(__sparc__)
++#    define systemd_NR_quotactl_fd 443
++#  elif defined(__x86_64__)
++#    if defined(__ILP32__)
++#      define systemd_NR_quotactl_fd (443 | /* __X32_SYSCALL_BIT */ 0x40000000)
++#    else
++#      define systemd_NR_quotactl_fd 443
++#    endif
++#  elif !defined(missing_arch_template)
++#    warning "quotactl_fd() syscall number is unknown for your architecture"
++#  endif
++
++/* may be an (invalid) negative number due to libseccomp, see PR 13319 */
++#  if defined __NR_quotactl_fd && __NR_quotactl_fd >= 0
++#    if defined systemd_NR_quotactl_fd
++assert_cc(__NR_quotactl_fd == systemd_NR_quotactl_fd);
++#    endif
++#  else
++#    if defined __NR_quotactl_fd
++#      undef __NR_quotactl_fd
++#    endif
++#    if defined systemd_NR_quotactl_fd && systemd_NR_quotactl_fd >= 0
++#      define __NR_quotactl_fd systemd_NR_quotactl_fd
++#    endif
++#  endif
++#endif
++
++#ifndef __IGNORE_removexattrat
++#  if defined(__aarch64__)
++#    define systemd_NR_removexattrat 466
++#  elif defined(__alpha__)
++#    define systemd_NR_removexattrat 576
++#  elif defined(__arc__) || defined(__tilegx__)
++#    define systemd_NR_removexattrat 466
++#  elif defined(__arm__)
++#    define systemd_NR_removexattrat 466
++#  elif defined(__i386__)
++#    define systemd_NR_removexattrat 466
++#  elif defined(__ia64__)
++#    define systemd_NR_removexattrat -1
++#  elif defined(__loongarch_lp64)
++#    define systemd_NR_removexattrat 466
++#  elif defined(__m68k__)
++#    define systemd_NR_removexattrat 466
++#  elif defined(_MIPS_SIM)
++#    if _MIPS_SIM == _MIPS_SIM_ABI32
++#      define systemd_NR_removexattrat 4466
++#    elif _MIPS_SIM == _MIPS_SIM_NABI32
++#      define systemd_NR_removexattrat 6466
++#    elif _MIPS_SIM == _MIPS_SIM_ABI64
++#      define systemd_NR_removexattrat 5466
++#    else
++#      error "Unknown MIPS ABI"
++#    endif
++#  elif defined(__hppa__)
++#    define systemd_NR_removexattrat 466
++#  elif defined(__powerpc__)
++#    define systemd_NR_removexattrat 466
++#  elif defined(__riscv)
++#    if __riscv_xlen == 32
++#      define systemd_NR_removexattrat 466
++#    elif __riscv_xlen == 64
++#      define systemd_NR_removexattrat 466
++#    else
++#      error "Unknown RISC-V ABI"
++#    endif
++#  elif defined(__s390__)
++#    define systemd_NR_removexattrat 466
++#  elif defined(__sparc__)
++#    define systemd_NR_removexattrat 466
++#  elif defined(__x86_64__)
++#    if defined(__ILP32__)
++#      define systemd_NR_removexattrat (466 | /* __X32_SYSCALL_BIT */ 0x40000000)
++#    else
++#      define systemd_NR_removexattrat 466
++#    endif
++#  elif !defined(missing_arch_template)
++#    warning "removexattrat() syscall number is unknown for your architecture"
++#  endif
++
++/* may be an (invalid) negative number due to libseccomp, see PR 13319 */
++#  if defined __NR_removexattrat && __NR_removexattrat >= 0
++#    if defined systemd_NR_removexattrat
++assert_cc(__NR_removexattrat == systemd_NR_removexattrat);
++#    endif
++#  else
++#    if defined __NR_removexattrat
++#      undef __NR_removexattrat
++#    endif
++#    if defined systemd_NR_removexattrat && systemd_NR_removexattrat >= 0
++#      define __NR_removexattrat systemd_NR_removexattrat
++#    endif
++#  endif
++#endif
++
++#ifndef __IGNORE_renameat2
++#  if defined(__aarch64__)
++#    define systemd_NR_renameat2 276
++#  elif defined(__alpha__)
++#    define systemd_NR_renameat2 510
++#  elif defined(__arc__) || defined(__tilegx__)
++#    define systemd_NR_renameat2 276
++#  elif defined(__arm__)
++#    define systemd_NR_renameat2 382
++#  elif defined(__i386__)
++#    define systemd_NR_renameat2 353
++#  elif defined(__ia64__)
++#    define systemd_NR_renameat2 1338
++#  elif defined(__loongarch_lp64)
++#    define systemd_NR_renameat2 276
++#  elif defined(__m68k__)
++#    define systemd_NR_renameat2 351
++#  elif defined(_MIPS_SIM)
++#    if _MIPS_SIM == _MIPS_SIM_ABI32
++#      define systemd_NR_renameat2 4351
++#    elif _MIPS_SIM == _MIPS_SIM_NABI32
++#      define systemd_NR_renameat2 6315
++#    elif _MIPS_SIM == _MIPS_SIM_ABI64
++#      define systemd_NR_renameat2 5311
++#    else
++#      error "Unknown MIPS ABI"
++#    endif
++#  elif defined(__hppa__)
++#    define systemd_NR_renameat2 337
++#  elif defined(__powerpc__)
++#    define systemd_NR_renameat2 357
++#  elif defined(__riscv)
++#    if __riscv_xlen == 32
++#      define systemd_NR_renameat2 276
++#    elif __riscv_xlen == 64
++#      define systemd_NR_renameat2 276
++#    else
++#      error "Unknown RISC-V ABI"
++#    endif
++#  elif defined(__s390__)
++#    define systemd_NR_renameat2 347
++#  elif defined(__sparc__)
++#    define systemd_NR_renameat2 345
++#  elif defined(__x86_64__)
++#    if defined(__ILP32__)
++#      define systemd_NR_renameat2 (316 | /* __X32_SYSCALL_BIT */ 0x40000000)
++#    else
++#      define systemd_NR_renameat2 316
++#    endif
++#  elif !defined(missing_arch_template)
++#    warning "renameat2() syscall number is unknown for your architecture"
++#  endif
++
++/* may be an (invalid) negative number due to libseccomp, see PR 13319 */
++#  if defined __NR_renameat2 && __NR_renameat2 >= 0
++#    if defined systemd_NR_renameat2
++assert_cc(__NR_renameat2 == systemd_NR_renameat2);
++#    endif
++#  else
++#    if defined __NR_renameat2
++#      undef __NR_renameat2
++#    endif
++#    if defined systemd_NR_renameat2 && systemd_NR_renameat2 >= 0
++#      define __NR_renameat2 systemd_NR_renameat2
++#    endif
++#  endif
++#endif
++
++#ifndef __IGNORE_setns
++#  if defined(__aarch64__)
++#    define systemd_NR_setns 268
++#  elif defined(__alpha__)
++#    define systemd_NR_setns 501
++#  elif defined(__arc__) || defined(__tilegx__)
++#    define systemd_NR_setns 268
++#  elif defined(__arm__)
++#    define systemd_NR_setns 375
++#  elif defined(__i386__)
++#    define systemd_NR_setns 346
++#  elif defined(__ia64__)
++#    define systemd_NR_setns 1330
++#  elif defined(__loongarch_lp64)
++#    define systemd_NR_setns 268
++#  elif defined(__m68k__)
++#    define systemd_NR_setns 344
++#  elif defined(_MIPS_SIM)
++#    if _MIPS_SIM == _MIPS_SIM_ABI32
++#      define systemd_NR_setns 4344
++#    elif _MIPS_SIM == _MIPS_SIM_NABI32
++#      define systemd_NR_setns 6308
++#    elif _MIPS_SIM == _MIPS_SIM_ABI64
++#      define systemd_NR_setns 5303
++#    else
++#      error "Unknown MIPS ABI"
++#    endif
++#  elif defined(__hppa__)
++#    define systemd_NR_setns 328
++#  elif defined(__powerpc__)
++#    define systemd_NR_setns 350
++#  elif defined(__riscv)
++#    if __riscv_xlen == 32
++#      define systemd_NR_setns 268
++#    elif __riscv_xlen == 64
++#      define systemd_NR_setns 268
++#    else
++#      error "Unknown RISC-V ABI"
++#    endif
++#  elif defined(__s390__)
++#    define systemd_NR_setns 339
++#  elif defined(__sparc__)
++#    define systemd_NR_setns 337
++#  elif defined(__x86_64__)
++#    if defined(__ILP32__)
++#      define systemd_NR_setns (308 | /* __X32_SYSCALL_BIT */ 0x40000000)
++#    else
++#      define systemd_NR_setns 308
++#    endif
++#  elif !defined(missing_arch_template)
++#    warning "setns() syscall number is unknown for your architecture"
++#  endif
++
++/* may be an (invalid) negative number due to libseccomp, see PR 13319 */
++#  if defined __NR_setns && __NR_setns >= 0
++#    if defined systemd_NR_setns
++assert_cc(__NR_setns == systemd_NR_setns);
++#    endif
++#  else
++#    if defined __NR_setns
++#      undef __NR_setns
++#    endif
++#    if defined systemd_NR_setns && systemd_NR_setns >= 0
++#      define __NR_setns systemd_NR_setns
++#    endif
++#  endif
++#endif
++
++#ifndef __IGNORE_setxattrat
++#  if defined(__aarch64__)
++#    define systemd_NR_setxattrat 463
++#  elif defined(__alpha__)
++#    define systemd_NR_setxattrat 573
++#  elif defined(__arc__) || defined(__tilegx__)
++#    define systemd_NR_setxattrat 463
++#  elif defined(__arm__)
++#    define systemd_NR_setxattrat 463
++#  elif defined(__i386__)
++#    define systemd_NR_setxattrat 463
++#  elif defined(__ia64__)
++#    define systemd_NR_setxattrat -1
++#  elif defined(__loongarch_lp64)
++#    define systemd_NR_setxattrat 463
++#  elif defined(__m68k__)
++#    define systemd_NR_setxattrat 463
++#  elif defined(_MIPS_SIM)
++#    if _MIPS_SIM == _MIPS_SIM_ABI32
++#      define systemd_NR_setxattrat 4463
++#    elif _MIPS_SIM == _MIPS_SIM_NABI32
++#      define systemd_NR_setxattrat 6463
++#    elif _MIPS_SIM == _MIPS_SIM_ABI64
++#      define systemd_NR_setxattrat 5463
++#    else
++#      error "Unknown MIPS ABI"
++#    endif
++#  elif defined(__hppa__)
++#    define systemd_NR_setxattrat 463
++#  elif defined(__powerpc__)
++#    define systemd_NR_setxattrat 463
++#  elif defined(__riscv)
++#    if __riscv_xlen == 32
++#      define systemd_NR_setxattrat 463
++#    elif __riscv_xlen == 64
++#      define systemd_NR_setxattrat 463
++#    else
++#      error "Unknown RISC-V ABI"
++#    endif
++#  elif defined(__s390__)
++#    define systemd_NR_setxattrat 463
++#  elif defined(__sparc__)
++#    define systemd_NR_setxattrat 463
++#  elif defined(__x86_64__)
++#    if defined(__ILP32__)
++#      define systemd_NR_setxattrat (463 | /* __X32_SYSCALL_BIT */ 0x40000000)
++#    else
++#      define systemd_NR_setxattrat 463
++#    endif
++#  elif !defined(missing_arch_template)
++#    warning "setxattrat() syscall number is unknown for your architecture"
++#  endif
++
++/* may be an (invalid) negative number due to libseccomp, see PR 13319 */
++#  if defined __NR_setxattrat && __NR_setxattrat >= 0
++#    if defined systemd_NR_setxattrat
++assert_cc(__NR_setxattrat == systemd_NR_setxattrat);
++#    endif
++#  else
++#    if defined __NR_setxattrat
++#      undef __NR_setxattrat
++#    endif
++#    if defined systemd_NR_setxattrat && systemd_NR_setxattrat >= 0
++#      define __NR_setxattrat systemd_NR_setxattrat
++#    endif
++#  endif
++#endif
++
++#ifndef __IGNORE_statx
++#  if defined(__aarch64__)
++#    define systemd_NR_statx 291
++#  elif defined(__alpha__)
++#    define systemd_NR_statx 522
++#  elif defined(__arc__) || defined(__tilegx__)
++#    define systemd_NR_statx 291
++#  elif defined(__arm__)
++#    define systemd_NR_statx 397
++#  elif defined(__i386__)
++#    define systemd_NR_statx 383
++#  elif defined(__ia64__)
++#    define systemd_NR_statx 1350
++#  elif defined(__loongarch_lp64)
++#    define systemd_NR_statx 291
++#  elif defined(__m68k__)
++#    define systemd_NR_statx 379
++#  elif defined(_MIPS_SIM)
++#    if _MIPS_SIM == _MIPS_SIM_ABI32
++#      define systemd_NR_statx 4366
++#    elif _MIPS_SIM == _MIPS_SIM_NABI32
++#      define systemd_NR_statx 6330
++#    elif _MIPS_SIM == _MIPS_SIM_ABI64
++#      define systemd_NR_statx 5326
++#    else
++#      error "Unknown MIPS ABI"
++#    endif
++#  elif defined(__hppa__)
++#    define systemd_NR_statx 349
++#  elif defined(__powerpc__)
++#    define systemd_NR_statx 383
++#  elif defined(__riscv)
++#    if __riscv_xlen == 32
++#      define systemd_NR_statx 291
++#    elif __riscv_xlen == 64
++#      define systemd_NR_statx 291
++#    else
++#      error "Unknown RISC-V ABI"
++#    endif
++#  elif defined(__s390__)
++#    define systemd_NR_statx 379
++#  elif defined(__sparc__)
++#    define systemd_NR_statx 360
++#  elif defined(__x86_64__)
++#    if defined(__ILP32__)
++#      define systemd_NR_statx (332 | /* __X32_SYSCALL_BIT */ 0x40000000)
++#    else
++#      define systemd_NR_statx 332
++#    endif
++#  elif !defined(missing_arch_template)
++#    warning "statx() syscall number is unknown for your architecture"
++#  endif
++
++/* may be an (invalid) negative number due to libseccomp, see PR 13319 */
++#  if defined __NR_statx && __NR_statx >= 0
++#    if defined systemd_NR_statx
++assert_cc(__NR_statx == systemd_NR_statx);
++#    endif
++#  else
++#    if defined __NR_statx
++#      undef __NR_statx
++#    endif
++#    if defined systemd_NR_statx && systemd_NR_statx >= 0
++#      define __NR_statx systemd_NR_statx
++#    endif
++#  endif
++#endif
+diff --git a/src/basic/mountpoint-util.c b/src/basic/mountpoint-util.c
+index b7c4870931..98e5096b23 100644
+--- a/src/basic/mountpoint-util.c
++++ b/src/basic/mountpoint-util.c
+@@ -11,6 +11,7 @@
+ #include "filesystems.h"
+ #include "fs-util.h"
+ #include "log.h"
++#include "missing_stat.h"
+ #include "mountpoint-util.h"
+ #include "nulstr-util.h"
+ #include "parse-util.h"
+@@ -246,7 +247,8 @@ int is_mount_point_at(int fd, const char *filename, int flags) {
+          * with a variety of st_dev reported. Also, btrfs subvolumes have different st_dev, even though
+          * they aren't real mounts of their own. */
+ 
+-        struct statx sx = {}; /* explicitly initialize the struct to make msan silent. */
++        STRUCT_STATX_DEFINE(sx);
++
+         if (statx(fd, filename,
+                   at_flags_normalize_nofollow(flags) |
+                   AT_NO_AUTOMOUNT |            /* don't trigger automounts – mounts are a local concept, hence no need to trigger automounts to determine STATX_ATTR_MOUNT_ROOT */
+@@ -381,7 +383,7 @@ int path_get_mnt_id_at_fallback(int dir_fd, const char *path, int *ret) {
+ }
+ 
+ int path_get_mnt_id_at(int dir_fd, const char *path, int *ret) {
+-        struct statx sx;
++        STRUCT_NEW_STATX_DEFINE(buf);
+ 
+         assert(dir_fd >= 0 || dir_fd == AT_FDCWD);
+         assert(ret);
+@@ -392,11 +394,15 @@ int path_get_mnt_id_at(int dir_fd, const char *path, int *ret) {
+                   AT_NO_AUTOMOUNT |    /* don't trigger automounts, mnt_id is a local concept */
+                   AT_STATX_DONT_SYNC,  /* don't go to the network, mnt_id is a local concept */
+                   STATX_MNT_ID,
+-                  &sx) < 0)
+-                return -errno;
++                  &buf.sx) < 0) {
++                if (!ERRNO_IS_NOT_SUPPORTED(errno) && /* statx() is not supported by the kernel. */
++                    !ERRNO_IS_PRIVILEGE(errno) &&     /* maybe filtered by seccomp. */
++                    errno != EINVAL)                  /* glibc's fallback method returns EINVAL when AT_STATX_DONT_SYNC is set. */
++                        return -errno;
++        }
+ 
+-        if (FLAGS_SET(sx.stx_mask, STATX_MNT_ID)) {
+-                *ret = sx.stx_mnt_id;
++        if (FLAGS_SET(buf.nsx.stx_mask, STATX_MNT_ID)) {
++                *ret = buf.nsx.stx_mnt_id;
+                 return 0;
+         }
+ 
+diff --git a/src/basic/recurse-dir.c b/src/basic/recurse-dir.c
+index 4b4e08ada2..bab1b86e69 100644
+--- a/src/basic/recurse-dir.c
++++ b/src/basic/recurse-dir.c
+@@ -153,7 +153,7 @@ int recurse_dir(
+                 void *userdata) {
+ 
+         _cleanup_free_ DirectoryEntries *de = NULL;
+-        struct statx root_sx;
++        STRUCT_STATX_DEFINE(root_sx);
+         int r;
+ 
+         assert(dir_fd >= 0);
+@@ -196,7 +196,7 @@ int recurse_dir(
+                 struct dirent *i = *entry;
+                 _cleanup_close_ int inode_fd = -EBADF, subdir_fd = -EBADF;
+                 _cleanup_free_ char *joined = NULL;
+-                struct statx sx;
++                STRUCT_STATX_DEFINE(sx);
+                 bool sx_valid = false;
+                 const char *p;
+ 
+diff --git a/src/basic/stat-util.c b/src/basic/stat-util.c
+index 75fff4917f..a9d6a97d1c 100644
+--- a/src/basic/stat-util.c
++++ b/src/basic/stat-util.c
+@@ -467,8 +467,8 @@ bool statx_inode_same(const struct statx *a, const struct statx *b) {
+                 a->stx_ino == b->stx_ino;
+ }
+ 
+-bool statx_mount_same(const struct statx *a, const struct statx *b) {
+-        if (!statx_is_set(a) || !statx_is_set(b))
++bool statx_mount_same(const struct new_statx *a, const struct new_statx *b) {
++        if (!new_statx_is_set(a) || !new_statx_is_set(b))
+                 return false;
+ 
+         /* if we have the mount ID, that's all we need */
+diff --git a/src/basic/stat-util.h b/src/basic/stat-util.h
+index 48603e9e4a..ec5c84d3c5 100644
+--- a/src/basic/stat-util.h
++++ b/src/basic/stat-util.h
+@@ -5,6 +5,7 @@
+ #include <sys/statfs.h>         /* IWYU pragma: export */
+ 
+ #include "forward.h"
++#include "missing_stat.h"
+ 
+ int stat_verify_regular(const struct stat *st);
+ int verify_regular_at(int fd, const char *path, bool follow);
+@@ -85,12 +86,31 @@ bool stat_inode_same(const struct stat *a, const struct stat *b);
+ bool stat_inode_unmodified(const struct stat *a, const struct stat *b);
+ 
+ bool statx_inode_same(const struct statx *a, const struct statx *b);
+-bool statx_mount_same(const struct statx *a, const struct statx *b);
++bool statx_mount_same(const struct new_statx *a, const struct new_statx *b);
+ 
+ int statx_fallback(int dfd, const char *path, int flags, unsigned mask, struct statx *sx);
+ 
+ int xstatfsat(int dir_fd, const char *path, struct statfs *ret);
+ 
++#if HAS_FEATURE_MEMORY_SANITIZER
++#  warning "Explicitly initializing struct statx, to work around msan limitation. Please remove as soon as msan has been updated to not require this."
++#  define STRUCT_STATX_DEFINE(var)              \
++        struct statx var = {}
++#  define STRUCT_NEW_STATX_DEFINE(var)          \
++        union {                                 \
++                struct statx sx;                \
++                struct new_statx nsx;           \
++        } var = {}
++#else
++#  define STRUCT_STATX_DEFINE(var)              \
++        struct statx var
++#  define STRUCT_NEW_STATX_DEFINE(var)          \
++        union {                                 \
++                struct statx sx;                \
++                struct new_statx nsx;           \
++        } var
++#endif
++
+ usec_t statx_timestamp_load(const struct statx_timestamp *ts) _pure_;
+ nsec_t statx_timestamp_load_nsec(const struct statx_timestamp *ts) _pure_;
+ 
+@@ -112,3 +132,6 @@ static inline bool stat_is_set(const struct stat *st) {
+ static inline bool statx_is_set(const struct statx *sx) {
+         return sx && sx->stx_mask != 0;
+ }
++static inline bool new_statx_is_set(const struct new_statx *sx) {
++        return sx && sx->stx_mask != 0;
++}
+diff --git a/src/basic/xattr-util.c b/src/basic/xattr-util.c
+index 1bde725d1a..b56be1c2fc 100644
+--- a/src/basic/xattr-util.c
++++ b/src/basic/xattr-util.c
+@@ -412,7 +412,7 @@ int getcrtime_at(
+                 usec_t *ret) {
+ 
+         _cleanup_free_ le64_t *le = NULL;
+-        struct statx sx;
++        STRUCT_STATX_DEFINE(sx);
+         usec_t a, b;
+         int r;
+ 
+diff --git a/src/include/override/sys/generate-syscall.py b/src/include/override/sys/generate-syscall.py
+index e715bbb157..6e8087499d 100755
+--- a/src/include/override/sys/generate-syscall.py
++++ b/src/include/override/sys/generate-syscall.py
+@@ -14,6 +14,7 @@ SYSCALLS = [
+     'quotactl_fd',   # defined in glibc header since glibc-2.35
+     'removexattrat',
+     'setxattrat',
++    'statx',
+ ]
+ 
+ def dictify(f):
+diff --git a/src/shared/find-esp.c b/src/shared/find-esp.c
+index 33cc900e00..d1fe9cb545 100644
+--- a/src/shared/find-esp.c
++++ b/src/shared/find-esp.c
+@@ -276,7 +276,8 @@ static int verify_fsroot_dir(
+         bool searching = FLAGS_SET(flags, VERIFY_ESP_SEARCHING),
+                 unprivileged_mode = FLAGS_SET(flags, VERIFY_ESP_UNPRIVILEGED_MODE);
+         _cleanup_free_ char *f = NULL;
+-        struct statx sxa, sxb;
++        STRUCT_NEW_STATX_DEFINE(sxa);
++        STRUCT_NEW_STATX_DEFINE(sxb);
+         int r;
+ 
+         /* Checks if the specified directory is at the root of its file system, and returns device
+@@ -294,21 +295,21 @@ static int verify_fsroot_dir(
+                 return log_error_errno(r, "Failed to extract filename of %s: %m", path);
+ 
+         r = statx_fallback(dir_fd, strempty(f), AT_SYMLINK_NOFOLLOW|(isempty(f) ? AT_EMPTY_PATH : 0),
+-                           STATX_TYPE|STATX_INO|STATX_MNT_ID, &sxa);
++                           STATX_TYPE|STATX_INO|STATX_MNT_ID, &sxa.sx);
+         if (r < 0)
+                 return log_full_errno((searching && r == -ENOENT) ||
+                                       (unprivileged_mode && ERRNO_IS_PRIVILEGE(r)) ? LOG_DEBUG : LOG_ERR, r,
+                                       "Failed to determine block device node of \"%s\": %m", path);
+ 
+-        assert(S_ISDIR(sxa.stx_mode)); /* We used O_DIRECTORY above, when opening, so this must hold */
++        assert(S_ISDIR(sxa.sx.stx_mode)); /* We used O_DIRECTORY above, when opening, so this must hold */
+ 
+-        if (FLAGS_SET(sxa.stx_attributes_mask, STATX_ATTR_MOUNT_ROOT)) {
++        if (FLAGS_SET(sxa.sx.stx_attributes_mask, STATX_ATTR_MOUNT_ROOT)) {
+ 
+                 /* If we have STATX_ATTR_MOUNT_ROOT, we are happy, that's all we need. We operate under the
+                  * assumption that a top of a mount point is also the top of the file system. (Which of
+                  * course is strictly speaking not always true...) */
+ 
+-                if (!FLAGS_SET(sxa.stx_attributes, STATX_ATTR_MOUNT_ROOT))
++                if (!FLAGS_SET(sxa.sx.stx_attributes, STATX_ATTR_MOUNT_ROOT))
+                         return log_full_errno(searching ? LOG_DEBUG : LOG_ERR,
+                                               SYNTHETIC_ERRNO(searching ? EADDRNOTAVAIL : ENODEV),
+                                               "Directory \"%s\" is not the root of the file system.", path);
+@@ -317,15 +318,15 @@ static int verify_fsroot_dir(
+         }
+ 
+         /* Now let's look at the parent */
+-        r = statx_fallback(dir_fd, "", AT_EMPTY_PATH, STATX_TYPE|STATX_INO|STATX_MNT_ID, &sxb);
++        r = statx_fallback(dir_fd, "", AT_EMPTY_PATH, STATX_TYPE|STATX_INO|STATX_MNT_ID, &sxb.sx);
+         if (r < 0)
+                 return log_full_errno(unprivileged_mode && ERRNO_IS_PRIVILEGE(r) ? LOG_DEBUG : LOG_ERR, r,
+                                       "Failed to determine block device node of parent of \"%s\": %m", path);
+ 
+-        if (statx_inode_same(&sxa, &sxb)) /* for the root dir inode nr for both inodes will be the same */
++        if (statx_inode_same(&sxa.sx, &sxb.sx)) /* for the root dir inode nr for both inodes will be the same */
+                 goto success;
+ 
+-        if (statx_mount_same(&sxa, &sxb))
++        if (statx_mount_same(&sxa.nsx, &sxb.nsx))
+                 return log_full_errno(searching ? LOG_DEBUG : LOG_ERR,
+                                       SYNTHETIC_ERRNO(searching ? EADDRNOTAVAIL : ENODEV),
+                                       "Directory \"%s\" is not the root of the file system.", path);
+@@ -334,10 +335,10 @@ success:
+         if (!ret_dev)
+                 return 0;
+ 
+-        if (sxa.stx_dev_major == 0) /* Hmm, maybe a btrfs device, and the caller asked for the backing device? Then let's try to get it. */
++        if (sxa.sx.stx_dev_major == 0) /* Hmm, maybe a btrfs device, and the caller asked for the backing device? Then let's try to get it. */
+                 return btrfs_get_block_device_at(dir_fd, strempty(f), ret_dev);
+ 
+-        *ret_dev = makedev(sxa.stx_dev_major, sxa.stx_dev_minor);
++        *ret_dev = makedev(sxa.sx.stx_dev_major, sxa.sx.stx_dev_minor);
+         return 0;
+ }
+ 
+diff --git a/src/tmpfiles/tmpfiles.c b/src/tmpfiles/tmpfiles.c
+index 396e85134c..1421dd8777 100644
+--- a/src/tmpfiles/tmpfiles.c
++++ b/src/tmpfiles/tmpfiles.c
+@@ -559,7 +559,7 @@ static int opendir_and_stat(
+                 bool *ret_mountpoint) {
+ 
+         _cleanup_closedir_ DIR *d = NULL;
+-        struct statx sx1;
++        STRUCT_NEW_STATX_DEFINE(st1);
+         int r;
+ 
+         assert(path);
+@@ -586,23 +586,24 @@ static int opendir_and_stat(
+                 return 0;
+         }
+ 
+-        r = statx_fallback(dirfd(d), "", AT_EMPTY_PATH, STATX_MODE|STATX_INO|STATX_ATIME|STATX_MTIME, &sx1);
++        r = statx_fallback(dirfd(d), "", AT_EMPTY_PATH, STATX_MODE|STATX_INO|STATX_ATIME|STATX_MTIME, &st1.sx);
+         if (r < 0)
+                 return log_error_errno(r, "statx(%s) failed: %m", path);
+ 
+-        if (FLAGS_SET(sx1.stx_attributes_mask, STATX_ATTR_MOUNT_ROOT))
+-                *ret_mountpoint = FLAGS_SET(sx1.stx_attributes, STATX_ATTR_MOUNT_ROOT);
++        if (FLAGS_SET(st1.sx.stx_attributes_mask, STATX_ATTR_MOUNT_ROOT))
++                *ret_mountpoint = FLAGS_SET(st1.sx.stx_attributes, STATX_ATTR_MOUNT_ROOT);
+         else {
+-                struct statx sx2;
+-                r = statx_fallback(dirfd(d), "..", 0, STATX_INO, &sx2);
++                STRUCT_NEW_STATX_DEFINE(st2);
++
++                r = statx_fallback(dirfd(d), "..", 0, STATX_INO, &st2.sx);
+                 if (r < 0)
+                         return log_error_errno(r, "statx(%s/..) failed: %m", path);
+ 
+-                *ret_mountpoint = !statx_mount_same(&sx1, &sx2);
++                *ret_mountpoint = !statx_mount_same(&st1.nsx, &st2.nsx);
+         }
+ 
+         *ret = TAKE_PTR(d);
+-        *ret_sx = sx1;
++        *ret_sx = st1.sx;
+         return 1;
+ }
+ 
+@@ -701,7 +702,8 @@ static int dir_cleanup(
+                  * systems such as overlayfs better where each file is originating from a different
+                  * st_dev. */
+ 
+-                struct statx sx;
++                STRUCT_STATX_DEFINE(sx);
++
+                 r = statx_fallback(
+                                 dirfd(d), de->d_name,
+                                 AT_SYMLINK_NOFOLLOW|AT_NO_AUTOMOUNT,
+@@ -3005,7 +3007,7 @@ static int remove_recursive(
+                 bool remove_instance) {
+ 
+         _cleanup_closedir_ DIR *d = NULL;
+-        struct statx sx;
++        STRUCT_STATX_DEFINE(sx);
+         bool mountpoint;
+         int r;
+ 
+@@ -3155,7 +3157,7 @@ static int clean_item_instance(
+         usec_t cutoff = n - i->age;
+ 
+         _cleanup_closedir_ DIR *d = NULL;
+-        struct statx sx;
++        STRUCT_STATX_DEFINE(sx);
+         bool mountpoint;
+         int r;
+ 
+-- 
+2.51.0
+

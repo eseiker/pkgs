@@ -11,6 +11,7 @@ steps:
         sha512: "{{ .systemd_sha512 }}"
     env:
       SOURCE_DATE_EPOCH: {{ .BUILD_ARG_SOURCE_DATE_EPOCH }}
+      CC: "gcc -D__UAPI_DEF_ETHHDR=0 -D_LARGEFILE64_SOURCE -D__DEFINED_wchar_t"
     prepare:
       - |
         mkdir -p /tmp/systemd
@@ -18,34 +19,32 @@ steps:
         cd /tmp/systemd
 
         # Patches for musl from openembedded-core, MIT licensed
-        # Also replicated by Chimera Linux: https://github.com/chimera-linux/cports/tree/001642bd7691349e95574d93e325bb05d5dcb2c1/main/udev/patches
-        patch -p1 < /pkg/patches/0003-missing_type.h-add-comparison_fn_t.patch
-        patch -p1 < /pkg/patches/0004-add-fallback-parse_printf_format-implementation.patch
-        patch -p1 < /pkg/patches/0005-don-t-fail-if-GLOB_BRACE-and-GLOB_ALTDIRFUNC-is-not-.patch
-        patch -p1 < /pkg/patches/0007-Use-uintmax_t-for-handling-rlim_t.patch
-        patch -p1 < /pkg/patches/0008-Define-glibc-compatible-basename-for-non-glibc-syste.patch
-        patch -p1 < /pkg/patches/0009-Do-not-disable-buffering-when-writing-to-oom_score_a.patch
-        patch -p1 < /pkg/patches/0010-distinguish-XSI-compliant-strerror_r-from-GNU-specif.patch
-        patch -p1 < /pkg/patches/0011-avoid-redefinition-of-prctl_mm_map-structure.patch
-        patch -p1 < /pkg/patches/0012-do-not-disable-buffer-in-writing-files.patch
-        patch -p1 < /pkg/patches/0014-Handle-missing-gshadow.patch
-        patch -p1 < /pkg/patches/0015-missing_syscall.h-Define-MIPS-ABI-defines-for-musl.patch
-        patch -p1 < /pkg/patches/0017-Adjust-for-musl-headers.patch
-        patch -p1 < /pkg/patches/0019-errno-util-Make-STRERROR-portable-for-musl.patch
-        patch -p1 < /pkg/patches/0020-sd-event-Make-malloc_trim-conditional-on-glibc.patch
-        patch -p1 < /pkg/patches/0021-shared-Do-not-use-malloc_info-on-musl.patch
-        patch -p1 < /pkg/patches/0022-avoid-missing-LOCK_EX-declaration.patch
-        patch -p1 < /pkg/patches/0023-include-signal.h-to-avoid-the-undeclared-error.patch
-        patch -p1 < /pkg/patches/0024-undef-stdin-for-references-using-stdin-as-a-struct-m.patch
-        patch -p1 < /pkg/patches/0025-adjust-header-inclusion-order-to-avoid-redeclaration.patch
-        patch -p1 < /pkg/patches/0026-build-path.c-avoid-boot-time-segfault-for-musl.patch
-
-        # General improvement from OpenEmbedded
-        patch -p1 < /pkg/patches/0001-Do-not-create-var-log-README.patch
+        # https://patchwork.yoctoproject.org/project/oe-core/patch/20251016084700.1537381-2-Qi.Chen@windriver.com/
+        patch -p1 < /pkg/patches/0001-binfmt-Don-t-install-dependency-links-at-install-tim.patch
+        patch -p1 < /pkg/patches/0001-systemctl-Call-systemd-sysv-install-without-path.patch
+        patch -p1 < /pkg/patches/0002-implment-systemd-sysv-install-for-OE.patch
+        patch -p1 < /pkg/patches/0003-Do-not-create-var-log-README.patch
+        patch -p1 < /pkg/patches/0004-musl.h-introduce-header-file-and-add-__THROW.patch
+        patch -p1 < /pkg/patches/0005-add-fallback-parse_printf_format-implementation.patch
+        patch -p1 < /pkg/patches/0006-Make-mallinfo-related-contents-glibc-specific.patch
+        patch -p1 < /pkg/patches/0007-add-src-include-override-sys-prctl.h-to-avoid-redefi.patch
+        patch -p1 < /pkg/patches/0008-distinguish-XSI-compliant-strerror_r-from-GNU-specif.patch
+        patch -p1 < /pkg/patches/0009-errno-util-Make-STRERROR-portable-for-musl.patch
+        patch -p1 < /pkg/patches/0010-src-basic-format-util.h-define-RLIM_FMT-to-fit-musl-.patch
+        patch -p1 < /pkg/patches/0011-src-include-override-malloc.h-define-dummy-malloc_tr.patch
+        patch -p1 < /pkg/patches/0012-src-shared-condition.c-avoid-using-glibc-ConditionVe.patch
+        patch -p1 < /pkg/patches/0013-build-path.c-avoid-boot-time-segfault-for-musl.patch
+        patch -p1 < /pkg/patches/0014-Handle-missing-gshadow-for-musl.patch
+        patch -p1 < /pkg/patches/0015-Avoid-sequence-point-error.patch
+        patch -p1 < /pkg/patches/0016-Fix-the-segfault-for-glob-related-codes-and-define-d.patch
+        patch -p1 < /pkg/patches/0017-Always-include-netinet-if_ether.h-first.patch
 
         # Own fixes for musl
         patch -p1 < /pkg/patches/0001-chore-musl-headers-compatibility-for-udev.patch
-        patch -p0 < /pkg/patches/musl.patch
+        patch -p1 < /pkg/patches/tmp.patch
+        patch -p1 < /pkg/patches/0001-Revert-stat-util-drop-statx_fallback.patch
+        patch -p1 < /pkg/patches/0002-Revert-tree-wide-drop-workarounds-for-statx.patch
+        patch -p1 < /pkg/patches/musl.patch
 
         meson setup build \
           --buildtype=release \
@@ -56,7 +55,11 @@ steps:
           -Dblkid=enabled \
           -Dkmod=enabled \
           -Dopenssl=disabled \
-          -Dgshadow=false \
+          -Dgshadow=false -Didn=false -Dlocaled=false \
+          -Dnss-myhostname=false \
+          -Dnss-mymachines=false \
+          -Dnss-resolve=false \
+          -Dsysusers=false \
           -Dutmp=false \
           -Duserdb=false \
           -Ddbus=disabled \
